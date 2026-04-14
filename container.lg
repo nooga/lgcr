@@ -1,0 +1,396 @@
+;; container.lg — a minimal container runtime in let-go
+;;
+;; Usage:
+;;   let-go container.lg run <rootfs-dir> <command> [args...]
+;;   let-go container.lg pull <image>      (e.g. alpine:3.21, ubuntu:24.04)
+;;
+;; The "run" command re-execs itself in init mode inside new namespaces.
+;; The "init" command is internal — called by run via unshare(1).
+
+(ns container.runtime
+  (:require [syscall]
+            [string]
+            [io]))
+
+;; ---------------------------------------------------------------------------
+;; helpers
+;; ---------------------------------------------------------------------------
+
+(defn die [& msgs]
+  (binding [*out* *err*]
+    (println (apply str "error: " msgs)))
+  (os/exit 1))
+
+(defn sh! [& args]
+  (let [result (apply os/sh args)]
+    (when (not= 0 (:exit result))
+      (die "command failed: " (string/join " " args) "\n" (:err result)))
+    result))
+
+(defn path-join [& parts]
+  (string/join "/" parts))
+
+(defn exists? [path]
+  (not (nil? (os/stat path))))
+
+;; ---------------------------------------------------------------------------
+;; rootfs setup
+;; ---------------------------------------------------------------------------
+
+(defn setup-rootfs
+  "Prepare the container rootfs. Tries overlay first, falls back to cp.
+   Returns {:merged ... :run-dir ...} paths."
+  [base-rootfs container-id]
+  (let [run-dir  (path-join "/tmp/letgo-containers" container-id)
+        merged   (path-join run-dir "merged")
+        put-old  (path-join merged ".pivot_old")]
+    (sh! "mkdir" "-p" run-dir)
+    ;; try overlay, fall back to a simple copy
+    (let [ok (try
+               (let [upper (path-join run-dir "upper")
+                     work  (path-join run-dir "work")]
+                 (doseq [d [upper work merged]]
+                   (sh! "mkdir" "-p" d))
+                 (let [opts (str "lowerdir=" base-rootfs ",upperdir=" upper ",workdir=" work)]
+                   (syscall/mount "overlay" merged "overlay" 0 opts))
+                 (println "[let-go container] using overlay mount")
+                 true)
+               (catch e
+                 (println (str "[let-go container] overlay failed (" e "), falling back to copy"))
+                 (sh! "mkdir" "-p" merged)
+                 (sh! "cp" "-a" (str base-rootfs "/.") merged)
+                 false))]
+      {:merged merged :put-old put-old :run-dir run-dir :overlay? ok})))
+
+;; ---------------------------------------------------------------------------
+;; cgroup setup (cgroups v2)
+;; ---------------------------------------------------------------------------
+
+(defn setup-cgroups
+  "Create a cgroup for the container and apply limits.
+   limits is a map like {:memory \"512m\" :cpu \"50000 100000\" :pids \"64\"}"
+  [container-id limits]
+  (let [cg-path (path-join "/sys/fs/cgroup" (str "letgo-" container-id))]
+    (sh! "mkdir" "-p" cg-path)
+    ;; memory limit
+    (when-let [mem (:memory limits)]
+      (let [bytes (cond
+                    (string/ends-with? mem "g") (str (* (parse-int (subs mem 0 (- (count mem) 1))) 1073741824))
+                    (string/ends-with? mem "m") (str (* (parse-int (subs mem 0 (- (count mem) 1))) 1048576))
+                    (string/ends-with? mem "k") (str (* (parse-int (subs mem 0 (- (count mem) 1))) 1024))
+                    :else mem)]
+        (syscall/write-file (path-join cg-path "memory.max") bytes 0644)))
+    ;; cpu limit (microseconds quota per period)
+    (when-let [cpu (:cpu limits)]
+      (syscall/write-file (path-join cg-path "cpu.max") cpu 0644))
+    ;; pids limit
+    (when-let [pids (:pids limits)]
+      (syscall/write-file (path-join cg-path "pids.max") pids 0644))
+    cg-path))
+
+(defn cgroup-add-pid [cg-path pid]
+  (syscall/write-file (path-join cg-path "cgroup.procs") (str pid) 0644))
+
+;; ---------------------------------------------------------------------------
+;; container init (runs inside namespaces)
+;; ---------------------------------------------------------------------------
+
+(defn container-init
+  "Called inside the new namespaces. Sets up the mount tree and execs the command."
+  [rootfs hostname cmd args]
+  (let [merged  (:merged rootfs)
+        put-old (:put-old rootfs)]
+
+    ;; make our mount tree private so changes don't propagate to host
+    (syscall/mount "none" "/" "none" (bit-or syscall/MS_REC syscall/MS_PRIVATE) "")
+
+    ;; bind-mount merged onto itself so it becomes a mount point (required for pivot_root)
+    (syscall/mount merged merged "none" syscall/MS_BIND "")
+
+    ;; mount essential filesystems inside the new root
+    (let [proc-dir (path-join merged "proc")
+          sys-dir  (path-join merged "sys")
+          dev-dir  (path-join merged "dev")]
+
+      (sh! "mkdir" "-p" proc-dir sys-dir dev-dir)
+      (syscall/mount "proc" proc-dir "proc" 0 "")
+      (syscall/mount "sysfs" sys-dir "sysfs" (bit-or syscall/MS_NOSUID
+                                                      (bit-or syscall/MS_NOEXEC
+                                                              syscall/MS_NODEV)) "")
+      ;; bind-mount /dev from host (simple approach)
+      (syscall/mount "/dev" dev-dir "none" (bit-or syscall/MS_BIND syscall/MS_REC) ""))
+
+    ;; pivot root
+    (sh! "mkdir" "-p" put-old)
+    (syscall/pivot-root merged put-old)
+    (syscall/chdir "/")
+
+    ;; unmount the old root and remove it
+    (syscall/umount "/.pivot_old" 2) ;; MNT_DETACH = 2
+    (sh! "rm" "-rf" "/.pivot_old")
+
+    ;; set hostname
+    (syscall/sethostname hostname)
+
+    ;; exec the command
+    (let [bin (str "/bin/" cmd)
+          ;; try common paths
+          bin (cond
+                (exists? bin) bin
+                (exists? (str "/usr/bin/" cmd)) (str "/usr/bin/" cmd)
+                (exists? (str "/sbin/" cmd)) (str "/sbin/" cmd)
+                (exists? (str "/usr/sbin/" cmd)) (str "/usr/sbin/" cmd)
+                ;; if it's an absolute path, use it directly
+                (string/starts-with? cmd "/") cmd
+                :else (die "command not found: " cmd))]
+      (syscall/exec bin
+                    (into [bin] args)
+                    ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                     (str "HOSTNAME=" hostname)
+                     "HOME=/root"
+                     "TERM=xterm"]))))
+
+;; ---------------------------------------------------------------------------
+;; container run (host side)
+;; ---------------------------------------------------------------------------
+
+(defn gen-id []
+  (subs (str (rand-int 999999999)) 0 8))
+
+(defn do-run [rootfs-path command args opts]
+  (let [container-id (gen-id)
+        hostname     (get opts :hostname (str "lg-" container-id))
+        limits       (select-keys opts [:memory :cpu :pids])
+        self         (first os/args)]
+
+    (println (str "[let-go container] id=" container-id))
+    (println (str "[let-go container] rootfs=" rootfs-path))
+    (println (str "[let-go container] cmd=" command " " (string/join " " args)))
+
+    ;; set up overlay rootfs
+    (let [rootfs (setup-rootfs rootfs-path container-id)]
+      (println (str "[let-go container] overlay=" (:merged rootfs)))
+
+      ;; set up cgroups (if any limits)
+      (let [cg-path (when (seq limits)
+                      (let [cg (setup-cgroups container-id limits)]
+                        (println (str "[let-go container] cgroup=" cg))
+                        cg))]
+
+        ;; re-exec ourselves inside new namespaces via unshare(1)
+        ;; unshare --fork --pid gives us a proper PID namespace (child is PID 1)
+        (let [init-args ["unshare"
+                         "--fork" "--pid" "--mount" "--uts" "--ipc"
+                         self
+                         (second os/args) ;; the script path
+                         "init"
+                         (:merged rootfs)
+                         (:put-old rootfs)
+                         hostname
+                         command]
+              init-args (into init-args args)
+              result    (apply os/sh init-args)]
+
+          ;; cleanup
+          (println)
+          (println (str "[let-go container] container exited with code " (:exit result)))
+          (when (not= "" (:out result))
+            (print (:out result)))
+          (when (not= "" (:err result))
+            (binding [*out* *err*]
+              (print (:err result))))
+
+          ;; cleanup overlay
+          (try
+            (syscall/umount (:merged rootfs) 0)
+            (catch e nil))
+          (sh! "rm" "-rf" (:run-dir rootfs))
+
+          ;; cleanup cgroup
+          (when cg-path
+            (try
+              (sh! "rmdir" cg-path)
+              (catch e nil)))
+
+          (println (str "[let-go container] cleaned up"))
+          (os/exit (:exit result)))))))
+
+;; ---------------------------------------------------------------------------
+;; container init (called via unshare re-exec)
+;; ---------------------------------------------------------------------------
+
+(defn do-init [merged put-old hostname command args]
+  (container-init {:merged merged :put-old put-old}
+                  hostname command args))
+
+;; ---------------------------------------------------------------------------
+;; OCI registry pull
+;; ---------------------------------------------------------------------------
+
+(defn parse-image-ref
+  "Parse 'library/alpine:3.21' or 'alpine' into {:registry :repo :tag}"
+  [ref]
+  (let [;; default registry
+        parts (string/split ref "/")
+        ;; if first part has a dot or colon, it's a registry host
+        has-registry? (and (> (count parts) 1)
+                          (or (string/includes? (first parts) ".")
+                              (string/includes? (first parts) ":")))
+        registry (if has-registry? (first parts) "registry-1.docker.io")
+        repo-tag (if has-registry?
+                   (string/join "/" (rest parts))
+                   ref)
+        ;; split repo:tag
+        rt-parts (string/split repo-tag ":")
+        repo     (first rt-parts)
+        tag      (if (> (count rt-parts) 1) (second rt-parts) "latest")
+        ;; docker hub short names need library/ prefix
+        repo     (if (and (= registry "registry-1.docker.io")
+                          (not (string/includes? repo "/")))
+                   (str "library/" repo)
+                   repo)]
+    {:registry registry :repo repo :tag tag}))
+
+(defn registry-url [registry path]
+  (str "https://" registry path))
+
+(defn docker-auth-token
+  "Get a Bearer token for Docker Hub (anonymous pull)"
+  [repo]
+  (let [url (str "https://auth.docker.io/token?service=registry.docker.io&scope=repository:" repo ":pull")
+        resp (http/get url)
+        body (json/read-json (:body resp) {:keywords? true})]
+    (:token body)))
+
+(defn registry-get
+  "GET from registry with auth. Returns response map."
+  [registry repo path token opts]
+  (let [url     (registry-url registry (str "/v2/" repo path))
+        headers (cond-> {"Accept" (or (:accept opts)
+                                      "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json")}
+                  token (assoc "Authorization" (str "Bearer " token)))]
+    (http/get url (merge {:headers headers} (dissoc opts :accept)))))
+
+(defn pick-manifest
+  "From a manifest list/index, pick the manifest matching our arch."
+  [manifests arch os]
+  (first (filter (fn [m]
+                   (let [p (:platform m)]
+                     (and (= (:architecture p) arch)
+                          (= (:os p) os))))
+                 manifests)))
+
+(defn do-pull [image-ref]
+  (let [{:keys [registry repo tag]} (parse-image-ref image-ref)
+        rootfs-dir (str "/tmp/letgo-rootfs/" (string/replace repo "/" "_") "-" tag)
+        ;; detect arch from our own binary
+        our-arch (let [uname (:out (os/sh "uname" "-m"))]
+                   (cond
+                     (string/includes? uname "aarch64") "arm64"
+                     (string/includes? uname "x86_64")  "amd64"
+                     (string/includes? uname "arm")     "arm64"
+                     :else "amd64"))]
+
+    (println (str "[pull] " registry "/" repo ":" tag " (" our-arch ")"))
+
+    ;; get auth token (Docker Hub specific, other registries may not need it)
+    (let [token (when (= registry "registry-1.docker.io")
+                  (println "[pull] authenticating with Docker Hub...")
+                  (docker-auth-token repo))]
+
+      ;; fetch manifest (could be a manifest list or a single manifest)
+      (println "[pull] fetching manifest...")
+      (let [resp     (registry-get registry repo (str "/manifests/" tag) token {})
+            body     (json/read-json (:body resp) {:keywords? true})
+            media-type (or (:mediaType body)
+                          (get (:headers resp) "content-type"))]
+
+        ;; handle manifest list / OCI index → pick platform, fetch actual manifest
+        (let [manifest
+              (if (or (string/includes? (str media-type) "manifest.list")
+                      (string/includes? (str media-type) "image.index"))
+                ;; it's a fat manifest — pick our platform
+                (let [chosen (pick-manifest (:manifests body) our-arch "linux")]
+                  (if (nil? chosen)
+                    (die "no manifest found for " our-arch "/linux")
+                    (do
+                      (println (str "[pull] selected platform: " our-arch "/linux"))
+                      (let [digest (:digest chosen)
+                            resp2  (registry-get registry repo (str "/manifests/" digest) token
+                                                 {:accept (:mediaType chosen)})
+                            body2  (json/read-json (:body resp2) {:keywords? true})]
+                        body2))))
+                ;; single manifest, use as-is
+                body)
+
+              layers (:layers manifest)]
+
+          (println (str "[pull] " (count layers) " layers to download"))
+          (sh! "mkdir" "-p" rootfs-dir)
+
+          ;; download and extract each layer
+          (doseq [layer layers]
+            (let [digest    (:digest layer)
+                  size      (:size layer)
+                  short-dig (subs digest 7 19) ;; sha256:xxxx... → first 12 hex chars
+                  tmp-file  (str "/tmp/layer-" short-dig ".tar.gz")]
+
+              (println (str "[pull] layer " short-dig " (" size " bytes)"))
+
+              ;; stream download
+              (let [resp (registry-get registry repo (str "/blobs/" digest) token
+                                       {:accept "application/octet-stream"
+                                        :as     :stream})
+                    w    (io/writer tmp-file)]
+                (io/copy (:body resp) w)
+                (io/close w)
+                (io/close (:body resp)))
+
+              ;; extract layer
+              (sh! "tar" "xzf" tmp-file "-C" rootfs-dir)
+              (sh! "rm" "-f" tmp-file)))
+
+          (println (str "[pull] rootfs ready at " rootfs-dir))
+          rootfs-dir)))))
+
+;; ---------------------------------------------------------------------------
+;; main
+;; ---------------------------------------------------------------------------
+
+(let [args   (drop 2 os/args) ;; drop binary and script path
+      subcmd (first args)
+      rest   (vec (drop 1 args))]
+  (cond
+    (= subcmd "run")
+    (if (< (count rest) 2)
+      (die "usage: container.lg run <rootfs-dir> <command> [args...]")
+      (do-run (first rest)
+              (second rest)
+              (vec (drop 2 rest))
+              {}))
+
+    (= subcmd "init")
+    (if (< (count rest) 4)
+      (die "usage: container.lg init <merged> <put-old> <hostname> <command> [args...]")
+      (do-init (nth rest 0)
+               (nth rest 1)
+               (nth rest 2)
+               (nth rest 3)
+               (vec (drop 4 rest))))
+
+    (= subcmd "pull")
+    (if (< (count rest) 1)
+      (die "usage: container.lg pull <rootfs-url>")
+      (do-pull (first rest)))
+
+    :else
+    (do
+      (println "let-go container runtime")
+      (println)
+      (println "usage:")
+      (println "  container.lg run  <rootfs-dir> <command> [args...]")
+      (println "  container.lg pull <image>            (e.g. alpine:3.21)")
+      (println)
+      (println "examples:")
+      (println "  container.lg pull alpine:3.21")
+      (println "  container.lg run /tmp/letgo-rootfs/library_alpine-3.21 /bin/sh"))))

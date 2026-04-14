@@ -1,0 +1,48 @@
+(ns container.test-syscall
+  (:require [syscall]
+            [string]))
+
+(println "=== syscall namespace smoke test ===")
+(println)
+
+;; basic process info
+(println "pid:      " (syscall/getpid))
+(println "uid:      " (syscall/getuid))
+(println "gid:      " (syscall/getgid))
+(println)
+
+;; read something from /proc
+(println "--- /proc/self/status (first 5 lines) ---")
+(let [status (syscall/read-file "/proc/self/status")
+      lines  (take 5 (string/split status "\n"))]
+  (doseq [l lines]
+    (println l)))
+(println)
+
+;; test sethostname inside a UTS namespace
+(println "--- unshare UTS + sethostname ---")
+(syscall/unshare syscall/CLONE_NEWUTS)
+(syscall/sethostname "let-go-box")
+(let [hostname (string/trim (syscall/read-file "/proc/sys/kernel/hostname"))]
+  (println "hostname: " hostname))
+(println)
+
+;; test mount (proc inside a new mount namespace)
+(println "--- unshare MNT + mount proc ---")
+(syscall/unshare syscall/CLONE_NEWNS)
+(syscall/mkdir "/tmp/newproc" 0755)
+(syscall/mount "proc" "/tmp/newproc" "proc" 0 "")
+(println "mounted /tmp/newproc")
+(let [uptime (syscall/read-file "/tmp/newproc/uptime")]
+  (println "uptime:   " (string/trim uptime)))
+(syscall/umount "/tmp/newproc" 0)
+(println "unmounted /tmp/newproc")
+(println)
+
+;; test write-file + read-file round trip
+(println "--- write-file / read-file ---")
+(syscall/write-file "/tmp/letgo-test.txt" "hello from let-go syscall ns" 0644)
+(println "read back:" (syscall/read-file "/tmp/letgo-test.txt"))
+(println)
+
+(println "=== all good ===")
