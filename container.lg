@@ -179,15 +179,17 @@
 
         ;; re-exec ourselves inside new namespaces via unshare(1)
         ;; unshare --fork --pid gives us a proper PID namespace (child is PID 1)
-        (let [init-args ["unshare"
-                         "--fork" "--pid" "--mount" "--uts" "--ipc"
-                         self
-                         (second os/args) ;; the script path
-                         "init"
-                         (:merged rootfs)
-                         (:put-old rootfs)
-                         hostname
-                         command]
+        (let [bundled?  (not (string/ends-with? (str (second os/args)) ".lg"))
+              self-args (if bundled?
+                          [self]
+                          [self (second os/args)])
+              init-args (into ["unshare" "--fork" "--pid" "--mount" "--uts" "--ipc"]
+                              (concat self-args
+                                      ["init"
+                                       (:merged rootfs)
+                                       (:put-old rootfs)
+                                       hostname
+                                       command]))
               init-args (into init-args args)
               result    (apply os/sh init-args)]
 
@@ -357,9 +359,13 @@
 ;; main
 ;; ---------------------------------------------------------------------------
 
-(let [args   (drop 2 os/args) ;; drop binary and script path
-      subcmd (first args)
-      rest   (vec (drop 1 args))]
+;; detect bundled vs interpreted mode:
+;; interpreted: [binary, script.lg, subcmd, ...]  → drop 2
+;; bundled:     [binary, subcmd, ...]              → drop 1
+(let [bundled? (not (string/ends-with? (str (second os/args)) ".lg"))
+      args     (drop (if bundled? 1 2) os/args)
+      subcmd   (first args)
+      rest     (vec (drop 1 args))]
   (cond
     (= subcmd "run")
     (if (< (count rest) 2)
