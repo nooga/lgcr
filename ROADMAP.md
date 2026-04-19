@@ -25,16 +25,6 @@ list, stop, or reattach. After M1, lgcr feels like a runtime instead of a demo.
 - let-go: `syscall/spawn-async` + `pipe` + `kill` + signal constants,
   `Setsid` on spawned children so they survive parent session teardown
 
-**M1.2 — next slice**:
-- `ps [-a] [-q]`: list state dirs; running-state derived from pid liveness
-  (`kill -0`). Reuse `resolve-id` prefix lookup.
-- `stop [-t SECS] <id>`: `syscall/kill` SIGTERM, grace, SIGKILL
-- `kill [-s SIG] <id>`: direct signal delivery
-- `rm [-f] <id>`: teardown overlay + cgroup + state dir; `-f` implies stop
-- `inspect <id>`: dump state.json pretty-printed
-- `start <id>`: re-run a stopped one (shim respawn)
-- Name suggestion parity: when printing, always show short (12-char) id
-
 **M1.2 — done**:
 - `ps`, `stop`, `kill`, `rm`, `inspect`, `start`
 - Prefix-id resolution (min 2 chars, ambiguity check)
@@ -50,6 +40,12 @@ list, stop, or reattach. After M1, lgcr feels like a runtime instead of a demo.
 - Verified: SIGTERM forwarding (trap → clean exit), orphan reaping, SIGKILL
   semantics (signal=9, status=killed)
 
+**M1.x polish — done**:
+- Combined short flags (`-aq`) are split before flag parsing
+- ps renders docker-style "Up 5 seconds" / "Exited (0) 1 minute ago" /
+  "Killed (signal N) N ago"; CREATED column is relative
+- Epoch timestamps recorded alongside ISO strings in state.json
+
 ## M2 — OCI image config — done
 
 - `pull` fetches the manifest's config blob and writes a reduced
@@ -61,7 +57,9 @@ list, stop, or reattach. After M1, lgcr feels like a runtime instead of a demo.
 - ENV merges (image defaults, then user-provided `-e K=V`, then lgcr-supplied
   HOSTNAME/HOME/TERM); ensures a PATH default
 - WORKDIR: `chdir` inside the namespace before spawn
-- USER: deferred (needs uid resolution via `/etc/passwd` or numeric parsing)
+- USER (M2.1): `user[:group]` parsed from image config; numeric uids used
+  directly, names resolved via `/etc/passwd`/`/etc/group` inside the rootfs
+  after pivot-root; `syscall/setgid`+`setuid` before spawning the user cmd
 - `init` subcommand refactored: takes `<id>` and reads state.json (cleaner
   than passing 5 positionals)
 
