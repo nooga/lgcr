@@ -283,6 +283,26 @@ OUT=$("$LGCR" inspect "${CA:0:1}" 2>&1 || true)
 expect_contains "$OUT" "at least 2 characters" "min-prefix enforced"
 "$LGCR" rm -f "${CA:0:6}" "${CB:0:6}" > /dev/null
 
+section "run auto-pulls a missing image"
+# /tmp/letgo-rootfs lives on the Linux side (inside Lima). From the darwin
+# shim path, `rm` on the mac host would be a no-op, so skip that wipe when
+# we're not on Linux.
+if [ "$(uname)" = "Linux" ]; then
+    rm -rf /tmp/letgo-rootfs/library_hello-world-latest
+fi
+OUT=$("$LGCR" run --rm hello-world 2>&1)
+expect_contains "$OUT" "Hello from Docker!" "scratch-image binary ran to completion"
+if [ "$(uname)" = "Linux" ]; then
+    expect_contains "$OUT" "[pull]" "pull progress emitted on cold cache"
+fi
+
+section "scratch rootfs (no /bin/rm) does not kill init"
+# Regression: sh! on /.pivot_old used to fail on scratch images and leave a
+# dangling ctrl.sock. Running twice in a row exercises the post-pivot cleanup.
+OUT=$("$LGCR" run --rm hello-world 2>&1)
+expect_contains "$OUT" "Hello from Docker!" "second run also succeeds"
+expect_not_contains "$OUT" "control socket never ready" "no stale-socket error"
+
 # ---------------------------------------------------------------------------
 # cleanup
 # ---------------------------------------------------------------------------

@@ -340,7 +340,10 @@
     (syscall/pivot-root merged put-old)
     (syscall/chdir "/")
     (syscall/umount "/.pivot_old" 2)   ;; MNT_DETACH
-    (sh! "rm" "-rf" "/.pivot_old")
+    ;; Use syscall/rm-rf instead of `sh!` — after pivot_root the container's
+    ;; rootfs may not have /bin/rm (e.g. scratch images like hello-world),
+    ;; so exec'ing a shell-out binary here will fail and kill init.
+    (syscall/rm-rf "/.pivot_old")
     (syscall/sethostname hostname)
 
     (let [;; state-ch routes register/reap events to the state-mgr goroutine.
@@ -672,6 +675,8 @@
 
 ;; lib/parse-image-ref + image-rootfs-dir live in lib.lg
 
+(declare do-pull)
+
 (defn resolve-run-target
   "Resolve first positional of `run` to {:rootfs ..., :config ...}.
    Absolute existing dir → bare rootfs (no config).
@@ -682,7 +687,9 @@
     (let [ref (lib/parse-image-ref target)
           dir (lib/image-rootfs-dir ref)]
       (when-not (exists? dir)
-        (die "image not pulled: " target " (try: lgcr pull " target ")"))
+        (do-pull target)
+        (when-not (exists? dir)
+          (die "image pull did not produce rootfs: " dir)))
       {:rootfs dir
        :config (let [p (str dir "/.lgcr-config.json")]
                  (when (exists? p)
