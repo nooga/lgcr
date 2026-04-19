@@ -137,14 +137,20 @@ See [ROADMAP.md](./ROADMAP.md) for the plan. Short version:
 ## Testing
 
 ```bash
-./tests/run.sh         # bundle + unit tests (host) + e2e (Lima)
+./tests/run.sh         # bundle + unit + e2e (×2 on macOS) + shim-only checks
 ```
 
-- Unit tests (`tests/lib_test.lg`) cover the pure helpers in `lib.lg` via
-  let-go's built-in `test` ns.
-- E2E (`tests/e2e.sh`) drives the real `./lgcr` binary against a real kernel
-  inside Lima: run/ps/logs/stop/kill/rm/start/inspect, image-ref resolution,
-  env overrides, prefix-id ambiguity, signal propagation.
+- **Unit** (`tests/lib_test.lg`) — pure helpers in `lib.lg` via let-go's
+  built-in `test` ns.
+- **E2E** (`tests/e2e.sh`) — drives the real lgcr binary against a real
+  kernel: run/ps/logs/stop/kill/rm/start/inspect/exec, image-ref
+  resolution, env overrides, prefix-id ambiguity, signal propagation,
+  `-it` pty (winsize + interactive shell). On macOS the same suite runs
+  twice — once inside Lima against `lgcr.linux`, once from the host
+  against the darwin shim — proving both paths produce identical output.
+- **Shim** (`tests/e2e-shim.sh`) — darwin-only: error messages when
+  Lima/lgcr.linux are missing, output-parity vs direct linux invocation,
+  exit-code and signal round-tripping through the shim.
 
 ## How it works, briefly
 

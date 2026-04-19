@@ -16,7 +16,6 @@ if [ -z "${LGCR:-}" ]; then
         LGCR=/Users/nooga/lab/lgcr/lgcr
     fi
 fi
-STATE="${XDG_STATE_HOME:-$HOME/.local/state}/lgcr"
 IMG="${IMG:-alpine:3.21}"
 
 PASS=0
@@ -62,11 +61,26 @@ expect_not_contains() {
     fi
 }
 
+pty_run() {
+    # Run a shell command under a pty. `script`'s args differ between
+    # BSD (macOS) and util-linux — detect and dispatch. We deliberately
+    # swallow the inner exit status: callers assert on the captured
+    # output, not the rc, and `set -e` would otherwise abort the whole
+    # suite when the simulated shell exits non-zero.
+    if [ "$(uname)" = "Darwin" ]; then
+        script -q /dev/null sh -c "$*" || true
+    else
+        script -qc "$*" /dev/null || true
+    fi
+}
+
 json_field() {
-    local file="$1" field="$2"
-    # very small JSON extractor — state.json has no nested braces inside values
-    # we care about, so a naive sed is fine.
-    tr ',' '\n' < "$file" | sed -n "s/.*\"${field}\":\"\{0,1\}\([^\"\\}]*\).*/\1/p" | head -1
+    # (json_field <id> <field>) — reads state via `lgcr inspect` so this
+    # works whether we're running inside Lima or driving the darwin shim
+    # from the host (where the state dir lives on the VM side).
+    local id="$1" field="$2"
+    "$LGCR" inspect "$id" | tr ',' '\n' \
+        | sed -n "s/.*\"${field}\":\"\{0,1\}\([^\"\\}]*\).*/\1/p" | head -1
 }
 
 # ---------------------------------------------------------------------------
@@ -78,7 +92,12 @@ if [ ! -x "$LGCR" ]; then
     exit 1
 fi
 
-rm -rf "$STATE"
+# Wipe any leftover containers from a previous run via the tool itself —
+# works whether we're inside Lima or driving the darwin shim from the host,
+# since either way the state lives where $LGCR points at.
+for _id in $("$LGCR" ps -aq 2>/dev/null); do
+    "$LGCR" rm -f "$_id" > /dev/null 2>&1 || true
+done
 
 if [ ! -d "/tmp/letgo-rootfs/library_${IMG/:/-}" ]; then
     echo "=== pulling $IMG (one-time) ==="
@@ -127,9 +146,8 @@ sleep 1
 sleep 1
 OUT=$("$LGCR" logs "${CID3:0:6}")
 expect_contains "$OUT" "got-TERM" "trap ran"
-STATE_FILE="$STATE/containers/$CID3/state.json"
-expect_eq "$(json_field "$STATE_FILE" status)" "exited" "status=exited"
-expect_eq "$(json_field "$STATE_FILE" exit-code)" "42" "exit-code=42"
+expect_eq "$(json_field "${CID3:0:6}" status)" "exited" "status=exited"
+expect_eq "$(json_field "${CID3:0:6}" exit-code)" "42" "exit-code=42"
 "$LGCR" rm "${CID3:0:6}" > /dev/null
 
 section "kill -s KILL records signal 9"
@@ -137,9 +155,8 @@ CID4=$("$LGCR" run -d "$IMG" sleep 60 2>&1 | tail -1)
 sleep 1
 "$LGCR" kill -s KILL "${CID4:0:6}" > /dev/null
 sleep 1
-STATE_FILE="$STATE/containers/$CID4/state.json"
-expect_eq "$(json_field "$STATE_FILE" status)" "killed" "status=killed"
-expect_eq "$(json_field "$STATE_FILE" signal)" "9" "signal=9"
+expect_eq "$(json_field "${CID4:0:6}" status)" "killed" "status=killed"
+expect_eq "$(json_field "${CID4:0:6}" signal)" "9" "signal=9"
 "$LGCR" rm "${CID4:0:6}" > /dev/null
 
 section "rm refuses a running container; -f overrides"
@@ -151,10 +168,10 @@ else
     FAIL=$((FAIL + 1)); echo "  FAIL [${CURRENT}] rm did not refuse running container"
 fi
 "$LGCR" rm -f "${CID5:0:6}" > /dev/null
-if [ ! -d "$STATE/containers/$CID5" ]; then
-    PASS=$((PASS + 1)); echo "  ok  rm -f removed state dir"
+if "$LGCR" ps -aq 2>/dev/null | grep -q "${CID5:0:12}"; then
+    FAIL=$((FAIL + 1)); echo "  FAIL [${CURRENT}] container still listed after rm -f"
 else
-    FAIL=$((FAIL + 1)); echo "  FAIL [${CURRENT}] state dir still exists after rm -f"
+    PASS=$((PASS + 1)); echo "  ok  rm -f removed the container"
 fi
 
 section "start respawns a stopped container"
@@ -216,22 +233,22 @@ OUT=$("$LGCR" exec "${EXID:0:6}" cat /tmp/from-exec 2>&1)
 expect_contains "$OUT" "marker" "second exec sees first exec's file"
 
 section "exec -it allocates a pty (stdin is-a-tty, /dev/pts/N)"
-OUT=$(script -qc "$LGCR exec -it ${EXID:0:6} /bin/sh -c \"tty; [ -t 0 ] && echo is-tty || echo not-tty\"" /dev/null 2>&1)
+OUT=$(pty_run "$LGCR exec -it ${EXID:0:6} /bin/sh -c \"tty; [ -t 0 ] && echo is-tty || echo not-tty\"" 2>&1)
 expect_contains "$OUT" "/dev/pts/" "pty allocated"
 expect_contains "$OUT" "is-tty" "stdin is a tty"
 
 section "exec -it propagates initial winsize"
-OUT=$(script -qc "stty cols 133 rows 42 2>/dev/null; $LGCR exec -it ${EXID:0:6} stty size" /dev/null 2>&1)
+OUT=$(pty_run "stty cols 133 rows 42 2>/dev/null; $LGCR exec -it ${EXID:0:6} stty size" 2>&1)
 expect_contains "$OUT" "42 133" "stty size inside container"
 
 section "exec -it interactive shell accepts input"
-OUT=$(printf "echo hello-from-pty\nexit\n" | script -qc "$LGCR exec -it ${EXID:0:6} /bin/sh" /dev/null 2>&1)
+OUT=$(printf "echo hello-from-pty\nexit\n" | pty_run "$LGCR exec -it ${EXID:0:6} /bin/sh" 2>&1)
 expect_contains "$OUT" "hello-from-pty" "command output via stdin"
 
 "$LGCR" rm -f "${EXID:0:6}" > /dev/null
 
 section "run -it: interactive shell, pty, winsize"
-OUT=$(printf "echo hello-run-it\nexit 7\n" | script -qc "$LGCR run -it $IMG /bin/sh" /dev/null 2>&1)
+OUT=$(printf "echo hello-run-it\nexit 7\n" | pty_run "$LGCR run -it $IMG /bin/sh" 2>&1)
 expect_contains "$OUT" "hello-run-it" "shell saw stdin + produced output"
 
 section "run -it rejects -d"
