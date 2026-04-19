@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Bundle container.lg into a standalone linux binary using lg -b.
-# Runs entirely on the host (no Lima needed) using lg -bundle-base to
-# cross-bundle for linux/arm64 from macOS.
+# Bundle container.lg into a standalone linux/arm64 binary using lg -b.
 #
-# Produces a single static executable containing:
-#   - the let-go VM + stdlib
-#   - the compiled container.lg bytecode
+# On a macOS host we additionally compile a thin Go "forwarder" that
+# invokes the Linux binary inside a Lima VM — so `./lgcr` just works
+# as a command on macOS and the user never has to type `limactl shell`.
+#
+# Layout on macOS:   ./lgcr (darwin native)  +  ./lgcr.linux (the real one)
+# Layout on Linux:   ./lgcr (the real one)
 #
 # Usage: ./bundle.sh [output-name]
 #   default output: ./lgcr
@@ -30,13 +31,28 @@ echo "==> Building host let-go binary..."
 echo "==> Building linux/arm64 let-go binary..."
 (cd "$LETGO_SRC" && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o "$LG_LINUX" .)
 
-echo "==> Cross-bundling container.lg → $OUTPUT..."
-"$LG_HOST" -b "$OUTPUT" -bundle-base "$LG_LINUX" "$SCRIPT_DIR/container.lg"
+HOST_OS="$(uname)"
+if [ "$HOST_OS" = "Darwin" ]; then
+    LINUX_OUT="${OUTPUT}.linux"
+    echo "==> Cross-bundling container.lg → $LINUX_OUT..."
+    "$LG_HOST" -b "$LINUX_OUT" -bundle-base "$LG_LINUX" "$SCRIPT_DIR/container.lg"
+    chmod +x "$LINUX_OUT"
 
-chmod +x "$OUTPUT"
-SIZE=$(ls -lh "$OUTPUT" | awk '{print $5}')
-echo "==> Done: $OUTPUT ($SIZE)"
-echo
-echo "Usage:"
-echo "  limactl shell letgo sudo $OUTPUT pull alpine:3.21"
-echo "  limactl shell letgo sudo $OUTPUT run /tmp/letgo-rootfs/library_alpine-3.21 echo hello"
+    echo "==> Building macOS forwarder → $OUTPUT..."
+    (cd "$SCRIPT_DIR" && go build -o "$OUTPUT" darwin_wrapper.go)
+    chmod +x "$OUTPUT"
+
+    LSIZE=$(ls -lh "$LINUX_OUT" | awk '{print $5}')
+    DSIZE=$(ls -lh "$OUTPUT" | awk '{print $5}')
+    echo "==> Done: $OUTPUT ($DSIZE, macOS shim) + $LINUX_OUT ($LSIZE)"
+    echo
+    echo "Run directly on macOS — no limactl wrapper needed:"
+    echo "  $OUTPUT pull alpine:3.21"
+    echo "  $OUTPUT run alpine:3.21 echo hello"
+else
+    echo "==> Cross-bundling container.lg → $OUTPUT..."
+    "$LG_HOST" -b "$OUTPUT" -bundle-base "$LG_LINUX" "$SCRIPT_DIR/container.lg"
+    chmod +x "$OUTPUT"
+    SIZE=$(ls -lh "$OUTPUT" | awk '{print $5}')
+    echo "==> Done: $OUTPUT ($SIZE)"
+fi

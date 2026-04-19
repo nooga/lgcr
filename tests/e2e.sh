@@ -6,7 +6,16 @@
 
 set -eu
 
-LGCR="${LGCR:-/Users/nooga/lab/lgcr/lgcr}"
+# Prefer the lima-side (Linux) binary — when bundle.sh runs on macOS it
+# emits lgcr.linux alongside the darwin shim; on a Linux host there's just
+# the single lgcr binary.
+if [ -z "${LGCR:-}" ]; then
+    if [ -x /Users/nooga/lab/lgcr/lgcr.linux ]; then
+        LGCR=/Users/nooga/lab/lgcr/lgcr.linux
+    else
+        LGCR=/Users/nooga/lab/lgcr/lgcr
+    fi
+fi
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/lgcr"
 IMG="${IMG:-alpine:3.21}"
 

@@ -16,17 +16,24 @@ cd lgcr
 ./bundle.sh                                              # produces ./lgcr
 ```
 
-`bundle.sh` cross-compiles let-go for linux/arm64 on macOS and bakes the
-compiled `container.lg` into a single static binary (~14 MB). You get one
-file to ship.
+On Linux, `bundle.sh` cross-compiles let-go and bakes `container.lg` into
+a single static linux/arm64 binary (~14 MB).
 
-Runs on Linux. On macOS, run it inside a VM — [Lima](https://github.com/lima-vm/lima)
-is what the test suite uses:
+On **macOS**, it builds two things:
+
+- `./lgcr` — a tiny native darwin shim that transparently forwards every
+  invocation into a [Lima](https://github.com/lima-vm/lima) VM named `letgo`
+- `./lgcr.linux` — the real container runtime; sits next to the shim and is
+  reached via Lima's virtiofs mount of `/Users`
+
+You just run `./lgcr ...` on macOS and it works. The first time, bring up the VM:
 
 ```bash
+brew install lima
 limactl start --name=letgo --vm-type=vz --mount-writable --cpus=2 --memory=2
-limactl shell letgo sudo /path/to/lgcr run alpine:3.21 echo hi
 ```
+
+If Lima isn't installed or the VM isn't running, the shim yells with the fix.
 
 ## Quickstart
 
