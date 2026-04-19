@@ -1,146 +1,148 @@
-# lgcr — let-go container runtime
+# lgcr
 
-A minimal Linux container runtime written in [let-go](https://github.com/nooga/let-go) (a Clojure-compatible language that compiles to Go bytecode).
+A small Linux container runtime written in [let-go](https://github.com/nooga/let-go)
+(a Clojure-compatible language that compiles to Go bytecode).
 
-## What it does
+Docker-shaped CLI — pull, run, logs, ps, stop, rm, start, inspect — with
+proper namespace isolation, overlay rootfs, cgroups v2, and a PID-1 init that
+forwards signals and reaps zombies. All driven by a couple of `.lg` files.
 
-- **Pulls OCI images** from Docker Hub and other registries (token auth, manifest list resolution, multi-arch)
-- **Runs containers** with proper Linux namespace isolation (PID, mount, UTS, IPC)
-- **Overlay filesystem** with pivot_root for copy-on-write container layers
-- **Cgroups v2** resource limits (memory, CPU, PIDs)
-
-All in ~300 lines of Clojure.
-
-## Requirements
-
-- [let-go](https://github.com/nooga/let-go) v1.4.0+ (needs the `syscall` namespace)
-- Linux (runs in a VM on macOS — see Testing below)
-- Root privileges (for namespace and mount operations)
-
-## Usage
+## Install
 
 ```bash
-# Pull an image from Docker Hub
-let-go container.lg pull alpine:3.21
-
-# Run a command in a container
-let-go container.lg run /tmp/letgo-rootfs/library_alpine-3.21 echo "hello"
-
-# Run with any command
-let-go container.lg run /tmp/letgo-rootfs/library_alpine-3.21 cat /etc/os-release
-let-go container.lg run /tmp/letgo-rootfs/library_alpine-3.21 ls /
+git clone https://github.com/nooga/lgcr
+git clone https://github.com/nooga/let-go ../let-go      # sibling checkout
+cd lgcr
+./bundle.sh                                              # produces ./lgcr
 ```
 
-## How it works
+`bundle.sh` cross-compiles let-go for linux/arm64 on macOS and bakes the
+compiled `container.lg` into a single static binary (~14 MB). You get one
+file to ship.
 
-### Pull
+Runs on Linux. On macOS, run it inside a VM — [Lima](https://github.com/lima-vm/lima)
+is what the test suite uses:
 
-1. Parses image reference (e.g., `alpine:3.21` -> `registry-1.docker.io/library/alpine:3.21`)
-2. Gets a Bearer token from Docker Hub's auth endpoint
-3. Fetches the manifest list, picks the platform-specific manifest (arm64/amd64)
-4. Downloads each layer blob via streaming HTTP
-5. Extracts layers in order to build the rootfs
+```bash
+limactl start --name=letgo --vm-type=vz --mount-writable --cpus=2 --memory=2
+limactl shell letgo sudo /path/to/lgcr run alpine:3.21 echo hi
+```
 
-### Run
+## Quickstart
 
-Two-phase execution:
+```bash
+# Pull an image (real OCI registry, multi-arch, token auth)
+lgcr pull alpine:3.21
 
-**Phase 1 (host):** Prepares overlay filesystem over the base rootfs, sets up cgroups if configured, then re-executes itself inside new namespaces using `syscall/spawn` with clone flags.
+# Run a command
+lgcr run alpine:3.21 echo hi
 
-**Phase 2 (container init):** Makes the mount tree private, bind-mounts the rootfs, mounts `/proc`, `/sys`, `/dev`, calls `pivot_root` to switch the root filesystem, sets the hostname, then `exec`s the target command.
+# Run detached; tail the logs
+cid=$(lgcr run -d alpine:3.21 sh -c 'while :; do date; sleep 1; done')
+lgcr logs -f "$cid"
+```
 
-### What let-go brings
+## Commands
 
-- **Data literals as container specs** — images and configs are just maps
-- **Macros for DSLs** — Dockerfile-like syntax that compiles to layer operations
-- **Persistent data structures** — HAMT maps for layer management
-- **REPL** — debug containers interactively
-- **AOT compilation** — compile to a single static binary (~10MB, boots in 7ms)
+| Command | Description |
+|---|---|
+| `lgcr pull <image>` | Fetch an OCI image (Docker Hub or any v2 registry) |
+| `lgcr run [-d] [--rm] [-e K=V] <image\|rootfs> [cmd [args...]]` | Run a container, foreground or detached |
+| `lgcr ps [-a] [-q]` | List containers; `-a` includes exited, `-q` just ids |
+| `lgcr logs [-f] <id>` | Dump or tail captured stdout/stderr |
+| `lgcr stop [-t SECS] <id>...` | SIGTERM, grace, SIGKILL |
+| `lgcr kill [-s SIG] <id>...` | Send a signal by name (`KILL`, `TERM`, …) or number |
+| `lgcr rm [-f] <id>...` | Remove; `-f` kills a running container first |
+| `lgcr start <id>...` | Respawn a stopped container with the same config |
+| `lgcr inspect <id>` | Dump the container's state as JSON |
+
+Short id prefixes work everywhere — `lgcr stop a1b2` is fine if unambiguous.
+Short flags combine: `lgcr ps -aq` = `lgcr ps -a -q`.
+
+## Examples
+
+```bash
+# run -d + --rm: fire and forget
+lgcr run -d --rm alpine:3.21 sh -c 'echo done > /tmp/marker; sleep 5'
+
+# Pass env to the container (image env is preserved; your -e overrides)
+lgcr run -e RUST_LOG=debug -e PORT=8080 alpine:3.21 env
+
+# Stop with a custom grace period
+lgcr stop -t 30 abc123
+
+# docker-shaped ps output
+lgcr ps -a
+# ID            STATUS                          CREATED               COMMAND
+# a1b2c3d4e5f6  Up 12 seconds                   12 seconds ago        sh -c ./app
+# 9f8e7d6c5b4a  Exited (0) 2 minutes ago        3 minutes ago         echo hi
+
+# Inspect the full lifecycle record
+lgcr inspect a1b2 | jq .
+```
+
+## What it does well
+
+- **Real OCI pull** — registry client with token auth, manifest list
+  resolution, streaming layer download. No `curl`, no shell-outs.
+- **Image config applied** — ENTRYPOINT, CMD, ENV, WORKDIR, USER all picked up
+  from the image (numeric uids or names resolved via `/etc/passwd` inside
+  the rootfs).
+- **Proper PID 1** — the container init process becomes PID 1 in its own PID
+  namespace, reaps orphans, and forwards SIGTERM/INT/QUIT/HUP to the user
+  process. No more "docker stop hangs for 10 seconds" papercut.
+- **Per-container shim, no daemon** — `run -d` spawns a supervisor process
+  per container. The CLI itself is stateless; you can kill your shell and
+  containers keep running.
+- **Rootless-friendly state** — state lives in
+  `$XDG_STATE_HOME/lgcr/containers/<id>/` so you don't need `/var/lib`
+  root-owned directories.
+- **Accurate exit info** — `state.json` distinguishes a 0 exit from a
+  signal-killed 0 exit (yes, those are different): `:exit-code`, `:signal`,
+  `:status`.
+
+## What it doesn't do yet
+
+See [ROADMAP.md](./ROADMAP.md) for the plan. Short version:
+
+- No `exec` into a running container (M3)
+- No pty / `-it` (M3)
+- No networking — containers share the host network for now (M5)
+- No capability drop, seccomp, `no_new_privs` — unprivileged workloads only (M4)
+- No rootless user namespaces (M4)
+- No image build (M7 — a Lisp-macro DSL called `defcontainer` is planned)
+- No content-addressable image store — rootfs lands in `/tmp/letgo-rootfs/`
+  for now (M8)
 
 ## Testing
 
-### With Lima (recommended)
-
 ```bash
-# Install lima
-brew install lima
-
-# Create a VM
-limactl start --name=letgo --vm-type=vz --mount-writable --cpus=2 --memory=2
-
-# Build and test
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o letgo-linux github.com/nooga/let-go
-limactl shell letgo sudo ./letgo-linux container.lg pull alpine:3.21
-limactl shell letgo sudo ./letgo-linux container.lg run /tmp/letgo-rootfs/library_alpine-3.21 echo hello
+./tests/run.sh         # bundle + unit tests (host) + e2e (Lima)
 ```
 
-### With Podman
+- Unit tests (`tests/lib_test.lg`) cover the pure helpers in `lib.lg` via
+  let-go's built-in `test` ns.
+- E2E (`tests/e2e.sh`) drives the real `./lgcr` binary against a real kernel
+  inside Lima: run/ps/logs/stop/kill/rm/start/inspect, image-ref resolution,
+  env overrides, prefix-id ambiguity, signal propagation.
 
-```bash
-./test-in-podman.sh
-```
+## How it works, briefly
 
-Overlay mounts won't work inside podman (falls back to cp), but namespace isolation works with `--privileged`.
+See **[IMPLEMENTATION.md](./IMPLEMENTATION.md)** for the full walkthrough. The
+very-short version:
 
-## Architecture
-
-```
-container.lg
-  |
-  |-- pull: OCI registry client (http/get + json/read-json)
-  |     |-- auth token negotiation
-  |     |-- manifest list / platform resolution
-  |     |-- streaming layer download (io/copy)
-  |     '-- layer extraction (tar)
-  |
-  |-- run (host side):
-  |     |-- overlay mount (lowerdir=rootfs, upperdir=fresh)
-  |     |-- cgroups v2 setup (memory.max, cpu.max, pids.max)
-  |     '-- spawn child with CLONE_NEW{PID,NS,UTS,IPC}
-  |
-  '-- init (container side):
-        |-- make mount tree private
-        |-- mount /proc, /sys, /dev
-        |-- pivot_root + unmount old root
-        |-- sethostname
-        '-- exec target command
-```
-
-## Syscall namespace
-
-The container runtime uses let-go's `syscall` namespace which provides:
-
-| Function | Description |
-|---|---|
-| `clone`, `unshare` | Linux namespace creation |
-| `spawn` | Fork+exec with clone flags (captures stdout/stderr) |
-| `mount`, `umount` | Filesystem mounting |
-| `pivot-root` | Switch root filesystem |
-| `chroot`, `chdir` | Directory operations |
-| `mkdir`, `mkdir-p` | Create directories |
-| `rm`, `rm-rf`, `rmdir` | Remove files/directories |
-| `symlink`, `chmod` | Filesystem operations |
-| `sethostname` | UTS namespace hostname |
-| `exec` | Replace current process |
-| `getpid`, `getuid`, `getgid` | Process info |
-| `setuid`, `setgid` | Change credentials |
-| `waitpid` | Wait for child process |
-| `uname` | System information |
-| `read-file`, `write-file` | File I/O (for /proc, /sys/fs/cgroup) |
-
-Plus constants: `CLONE_NEW{NS,UTS,IPC,PID,NET,USER}`, `MS_{BIND,REC,PRIVATE,RDONLY,...}`, `WNOHANG`.
-
-## Roadmap
-
-- [ ] **Replace remaining shell-outs** — use `syscall/spawn` instead of `unshare(1)`, native tar extraction
-- [ ] **Image build DSL** — Dockerfile-like macros that compile to layer operations
-- [ ] **Networking** — veth pairs, bridge, NAT via iptables
-- [ ] **Port mapping** — `-p 8080:80` style port forwarding
-- [ ] **Layer caching** — store layers by sha256 digest, skip re-downloads
-- [ ] **Seccomp** — BPF syscall filter, compiled from Clojure DSL
-- [ ] **Volume mounts** — bind-mount host directories into containers
-- [ ] **Detach mode** — run containers in the background
-- [ ] **OCI image export** — produce standard OCI tarballs importable by docker/podman
+1. `pull` hits the registry, downloads + extracts layers, saves a reduced
+   config alongside the rootfs.
+2. `run -d` writes initial state, spawns `lgcr shim <id>` detached.
+3. The shim sets up an overlay rootfs + cgroup, then spawns `lgcr init <id>`
+   with `CLONE_NEW{NS,PID,UTS,IPC}` via `syscall/spawn-async`.
+4. `init` is now PID 1 in the new PID ns. It pivot-roots into the overlay,
+   drops to the image's USER, spawns the user command as a child, and runs
+   forever as reaper + signal forwarder.
+5. When the user process exits, init exits with `128 + signal` or the raw
+   exit status; shim reaps, records the final state, and exits.
+6. `lgcr stop` sends SIGTERM to init's pid; init forwards to the user
+   process through an `async/chan` wired via `syscall/signal-notify`.
 
 ## License
 
