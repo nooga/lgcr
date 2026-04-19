@@ -50,11 +50,20 @@ list, stop, or reattach. After M1, lgcr feels like a runtime instead of a demo.
 - Verified: SIGTERM forwarding (trap → clean exit), orphan reaping, SIGKILL
   semantics (signal=9, status=killed)
 
-## M2 — OCI image config
+## M2 — OCI image config — done
 
-We ignore `config.json` from the pulled manifest today, so the user has to type
-`/bin/sh` every time. Parse and apply ENTRYPOINT, CMD, ENV, WORKDIR, USER. Small
-change, disproportionate UX win: `lgcr run alpine` just works.
+- `pull` fetches the manifest's config blob and writes a reduced
+  `.lgcr-config.json` (entrypoint/cmd/env/workdir/user) into the rootfs dir
+- `run` accepts an image ref (`alpine:3.21`) or an absolute rootfs path;
+  image ref resolves to rootfs + config
+- Command composition: user cmd overrides CMD but keeps ENTRYPOINT; with no
+  user cmd, `ENTRYPOINT + CMD` is used
+- ENV merges (image defaults, then user-provided `-e K=V`, then lgcr-supplied
+  HOSTNAME/HOME/TERM); ensures a PATH default
+- WORKDIR: `chdir` inside the namespace before spawn
+- USER: deferred (needs uid resolution via `/etc/passwd` or numeric parsing)
+- `init` subcommand refactored: takes `<id>` and reads state.json (cleaner
+  than passing 5 positionals)
 
 ## M3 — exec & TTY
 

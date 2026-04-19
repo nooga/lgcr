@@ -208,67 +208,99 @@
 ;; container init (runs inside namespaces)
 ;; ---------------------------------------------------------------------------
 
+(def DEFAULT-PATH "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+
+(defn env-has-key?
+  "Check whether an env vector (of \"K=V\" strings) already sets K."
+  [env k]
+  (let [prefix (str k "=")]
+    (reduce (fn [acc e]
+              (or acc
+                  (and (string? e)
+                       (string/starts-with? e prefix))))
+            false env)))
+
+(defn merge-env
+  "Left-biased: keys present in `user` override `image`. If PATH is absent,
+   a sensible default is added. Non-string and nil entries are dropped."
+  [image user]
+  (let [clean (fn [xs]
+                (reduce (fn [acc e] (if (string? e) (conj acc e) acc)) [] (or xs [])))
+        image (clean image)
+        user  (clean user)
+        combined (reduce (fn [acc e]
+                           (let [k (first (string/split e "="))]
+                             (if (env-has-key? acc k)
+                               acc
+                               (conj acc e))))
+                         user
+                         image)]
+    (if (env-has-key? combined "PATH")
+      combined
+      (conj combined (str "PATH=" DEFAULT-PATH)))))
+
+(defn resolve-bin
+  "Find an executable: absolute path, or scan a few common dirs."
+  [cmd]
+  (cond
+    (string/starts-with? cmd "/") cmd
+    (exists? (str "/bin/" cmd))       (str "/bin/" cmd)
+    (exists? (str "/usr/bin/" cmd))   (str "/usr/bin/" cmd)
+    (exists? (str "/sbin/" cmd))      (str "/sbin/" cmd)
+    (exists? (str "/usr/sbin/" cmd))  (str "/usr/sbin/" cmd)
+    :else (die "command not found: " cmd)))
+
 (defn container-init
-  "Called inside the new namespaces. Sets up the mount tree and execs the command."
-  [rootfs hostname cmd args]
-  (let [merged  (:merged rootfs)
-        put-old (:put-old rootfs)]
+  "Called inside the new namespaces. Sets up the mount tree, becomes PID 1,
+   spawns the user command, forwards signals, reaps orphans.
+   state is the container's state.json map."
+  [state]
+  (let [merged   (:rootfs-merged state)
+        put-old  (path-join merged ".pivot_old")
+        hostname (:hostname state)
+        cmd      (:command state)
+        args     (:args state)
+        workdir  (:workdir state)
+        img-env  (or (:env-image state) [])
+        user-env (or (:env state) [])]
 
     ;; make our mount tree private so changes don't propagate to host
     (syscall/mount "none" "/" "none" (bit-or syscall/MS_REC syscall/MS_PRIVATE) "")
-
-    ;; bind-mount merged onto itself so it becomes a mount point (required for pivot_root)
+    ;; bind-mount merged onto itself so it becomes a mount point (pivot_root needs this)
     (syscall/mount merged merged "none" syscall/MS_BIND "")
-
     ;; mount essential filesystems inside the new root
     (let [proc-dir (path-join merged "proc")
           sys-dir  (path-join merged "sys")
           dev-dir  (path-join merged "dev")]
-
       (sh! "mkdir" "-p" proc-dir sys-dir dev-dir)
       (syscall/mount "proc" proc-dir "proc" 0 "")
       (syscall/mount "sysfs" sys-dir "sysfs" (bit-or syscall/MS_NOSUID
-                                                      (bit-or syscall/MS_NOEXEC
-                                                              syscall/MS_NODEV)) "")
-      ;; bind-mount /dev from host (simple approach)
+                                                     (bit-or syscall/MS_NOEXEC
+                                                             syscall/MS_NODEV)) "")
       (syscall/mount "/dev" dev-dir "none" (bit-or syscall/MS_BIND syscall/MS_REC) ""))
-
-    ;; pivot root
     (sh! "mkdir" "-p" put-old)
     (syscall/pivot-root merged put-old)
     (syscall/chdir "/")
-
-    ;; unmount the old root and remove it
-    (syscall/umount "/.pivot_old" 2) ;; MNT_DETACH = 2
+    (syscall/umount "/.pivot_old" 2)   ;; MNT_DETACH
     (sh! "rm" "-rf" "/.pivot_old")
-
-    ;; set hostname
     (syscall/sethostname hostname)
+    (when (and workdir (not= "" workdir))
+      (try (syscall/chdir workdir) (catch e nil)))
 
-    ;; resolve the binary
-    (let [bin (str "/bin/" cmd)
-          bin (cond
-                (exists? bin) bin
-                (exists? (str "/usr/bin/" cmd)) (str "/usr/bin/" cmd)
-                (exists? (str "/sbin/" cmd)) (str "/sbin/" cmd)
-                (exists? (str "/usr/sbin/" cmd)) (str "/usr/sbin/" cmd)
-                (string/starts-with? cmd "/") cmd
-                :else (die "command not found: " cmd))
+    (let [bin  (resolve-bin cmd)
           argv (into [bin] args)
-          env  ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-                (str "HOSTNAME=" hostname)
-                "HOME=/root"
-                "TERM=xterm"]
-          ;; signal channel — let-go goroutine forwards to user-pid
-          sig-ch (async/chan 8)
-          _ (syscall/signal-notify sig-ch
-                                   syscall/SIGTERM syscall/SIGINT
-                                   syscall/SIGQUIT syscall/SIGHUP)
-          ;; spawn the user command as a child. We stay PID 1 in the ns.
-          res  (syscall/spawn-async bin argv env 0 *in* *out* *err*)
+          env  (merge-env img-env
+                          (conj user-env
+                                (str "HOSTNAME=" hostname)
+                                "HOME=/root"
+                                "TERM=xterm"))
+          sig-ch   (async/chan 8)
+          _        (syscall/signal-notify sig-ch
+                                          syscall/SIGTERM syscall/SIGINT
+                                          syscall/SIGQUIT syscall/SIGHUP)
+          res      (syscall/spawn-async bin argv env 0 *in* *out* *err*)
           user-pid (:pid res)]
 
-      ;; signal forwarder: everything we catch gets relayed to the user proc
       (async/go* (fn []
                    (loop []
                      (let [sig (async/<! sig-ch)]
@@ -276,16 +308,13 @@
                          (try (syscall/kill user-pid sig) (catch e nil))
                          (recur))))))
 
-      ;; reap zombies and wait for user-pid to exit. waitpid(-1) catches any
-      ;; child; we only care about the user's final status, but reaping the
-      ;; rest prevents zombie accumulation for multi-process containers.
       (loop []
         (let [wr (syscall/waitpid -1 0)]
           (if (= (:pid wr) user-pid)
             (let [sg (:signal wr)
                   st (:status wr)]
               (os/exit (cond
-                         (> sg 0) (+ 128 sg)  ;; conventional 128+signal
+                         (> sg 0) (+ 128 sg)
                          :else    st)))
             (recur)))))))
 
@@ -338,13 +367,7 @@
         rootfs  (setup-rootfs (:rootfs-src state) container-id)
         cg-path (when (seq (:limits state))
                   (setup-cgroups container-id (:limits state)))
-        argv    (into (self-prefix)
-                      (into ["init"
-                             (:merged rootfs)
-                             (:put-old rootfs)
-                             (:hostname state)
-                             (:command state)]
-                            (:args state)))
+        argv    (into (self-prefix) ["init" container-id])
         cloneflags (bit-or (bit-or syscall/CLONE_NEWNS  syscall/CLONE_NEWPID)
                            (bit-or syscall/CLONE_NEWUTS syscall/CLONE_NEWIPC))]
 
@@ -380,8 +403,67 @@
 
       (os/exit (if (neg? exit) 1 exit)))))
 
-(defn do-run [rootfs-path command args opts]
-  (let [container-id (gen-id)
+(defn parse-image-ref
+  "Parse 'library/alpine:3.21' or 'alpine' into {:registry :repo :tag}"
+  [ref]
+  (let [parts (string/split ref "/")
+        has-registry? (and (> (count parts) 1)
+                           (or (string/includes? (first parts) ".")
+                               (string/includes? (first parts) ":")))
+        registry (if has-registry? (first parts) "registry-1.docker.io")
+        repo-tag (if has-registry? (string/join "/" (rest parts)) ref)
+        rt-parts (string/split repo-tag ":")
+        repo     (first rt-parts)
+        tag      (if (> (count rt-parts) 1) (second rt-parts) "latest")
+        repo     (if (and (= registry "registry-1.docker.io")
+                          (not (string/includes? repo "/")))
+                   (str "library/" repo)
+                   repo)]
+    {:registry registry :repo repo :tag tag}))
+
+(defn image-rootfs-dir [parsed]
+  (str "/tmp/letgo-rootfs/"
+       (string/replace (:repo parsed) "/" "_")
+       "-" (:tag parsed)))
+
+(defn resolve-run-target
+  "Resolve first positional of `run` to {:rootfs ..., :config ...}.
+   Absolute existing dir → bare rootfs (no config).
+   Otherwise → treated as image ref, looked up in /tmp/letgo-rootfs."
+  [target]
+  (if (and (string/starts-with? target "/") (exists? target))
+    {:rootfs target :config nil}
+    (let [ref (parse-image-ref target)
+          dir (image-rootfs-dir ref)]
+      (when-not (exists? dir)
+        (die "image not pulled: " target " (try: lgcr pull " target ")"))
+      {:rootfs dir
+       :config (let [p (str dir "/.lgcr-config.json")]
+                 (when (exists? p)
+                   (json/read-json (slurp p) {:keywords? true})))})))
+
+(defn strip-nils
+  "A JSON null inside a list can come through as nil; drop those."
+  [xs]
+  (reduce (fn [acc x] (if (nil? x) acc (conj acc x))) [] (or xs [])))
+
+(defn compose-command
+  "Apply OCI image defaults. Returns [command args]."
+  [config user-cmd user-args]
+  (let [ep       (strip-nils (:entrypoint config))
+        cfg-cmd  (strip-nils (:cmd config))
+        combined (cond
+                   user-cmd (into ep (into [user-cmd] user-args))
+                   (or (seq ep) (seq cfg-cmd)) (into ep cfg-cmd)
+                   :else nil)]
+    (when (nil? combined)
+      (die "no command: image has no ENTRYPOINT or CMD and none was given"))
+    [(first combined) (vec (rest combined))]))
+
+(defn do-run [target user-cmd user-args opts]
+  (let [{:keys [rootfs config]} (resolve-run-target target)
+        [command args] (compose-command config user-cmd user-args)
+        container-id (gen-id)
         hostname     (get opts :hostname (str "lg-" (short-id container-id)))
         limits       (select-keys opts [:memory :cpu :pids])
         detached?    (:detached? opts)]
@@ -390,10 +472,14 @@
     (syscall/mkdir-p (container-dir container-id) 0755)
     (write-state {:id         container-id
                   :status     "created"
-                  :rootfs-src rootfs-path
+                  :rootfs-src rootfs
+                  :image      (when config target)
                   :command    command
                   :args       args
                   :hostname   hostname
+                  :workdir    (or (:workdir config) "")
+                  :env-image  (or (:env config) [])
+                  :env        (or (:extra-env opts) [])
                   :limits     limits
                   :detached?  (boolean detached?)
                   :rm?        (boolean (:rm? opts))
@@ -412,9 +498,8 @@
 ;; container init (called via the cloneflags re-exec)
 ;; ---------------------------------------------------------------------------
 
-(defn do-init [merged put-old hostname command args]
-  (container-init {:merged merged :put-old put-old}
-                  hostname command args))
+(defn do-init [container-id]
+  (container-init (read-state container-id)))
 
 ;; ---------------------------------------------------------------------------
 ;; shim — per-container supervisor (runs detached from the user's shell)
@@ -429,13 +514,7 @@
         rootfs     (setup-rootfs (:rootfs-src state) container-id)
         cg-path    (when (seq (:limits state))
                      (setup-cgroups container-id (:limits state)))
-        argv       (into (self-prefix)
-                         (into ["init"
-                                (:merged rootfs)
-                                (:put-old rootfs)
-                                (:hostname state)
-                                (:command state)]
-                               (:args state)))
+        argv       (into (self-prefix) ["init" container-id])
         cloneflags (bit-or (bit-or syscall/CLONE_NEWNS  syscall/CLONE_NEWPID)
                            (bit-or syscall/CLONE_NEWUTS syscall/CLONE_NEWIPC))]
 
@@ -652,30 +731,6 @@
 ;; OCI registry pull
 ;; ---------------------------------------------------------------------------
 
-(defn parse-image-ref
-  "Parse 'library/alpine:3.21' or 'alpine' into {:registry :repo :tag}"
-  [ref]
-  (let [;; default registry
-        parts (string/split ref "/")
-        ;; if first part has a dot or colon, it's a registry host
-        has-registry? (and (> (count parts) 1)
-                          (or (string/includes? (first parts) ".")
-                              (string/includes? (first parts) ":")))
-        registry (if has-registry? (first parts) "registry-1.docker.io")
-        repo-tag (if has-registry?
-                   (string/join "/" (rest parts))
-                   ref)
-        ;; split repo:tag
-        rt-parts (string/split repo-tag ":")
-        repo     (first rt-parts)
-        tag      (if (> (count rt-parts) 1) (second rt-parts) "latest")
-        ;; docker hub short names need library/ prefix
-        repo     (if (and (= registry "registry-1.docker.io")
-                          (not (string/includes? repo "/")))
-                   (str "library/" repo)
-                   repo)]
-    {:registry registry :repo repo :tag tag}))
-
 (defn registry-url [registry path]
   (str "https://" registry path))
 
@@ -775,6 +830,23 @@
               (sh! "tar" "xzf" tmp-file "-C" rootfs-dir)
               (sh! "rm" "-f" tmp-file)))
 
+          ;; fetch image config blob (ENTRYPOINT/CMD/ENV/WORKDIR/USER)
+          (when-let [cfg-ref (:config manifest)]
+            (println "[pull] fetching image config...")
+            (let [resp (registry-get registry repo
+                                     (str "/blobs/" (:digest cfg-ref))
+                                     token
+                                     {:accept "application/octet-stream"})
+                  full (json/read-json (:body resp) {:keywords? true})
+                  inner (:config full)
+                  reduced {:env        (or (:Env inner) [])
+                           :cmd        (or (:Cmd inner) [])
+                           :entrypoint (or (:Entrypoint inner) [])
+                           :workdir    (or (:WorkingDir inner) "")
+                           :user       (or (:User inner) "")}]
+              (spit (str rootfs-dir "/.lgcr-config.json")
+                    (json/write-json reduced))))
+
           (println (str "[pull] rootfs ready at " rootfs-dir))
           rootfs-dir)))))
 
@@ -791,18 +863,24 @@
       tail     (vec (drop 1 args))]
   (cond
     (= subcmd "run")
-    ;; parse flags: -d (detach), --rm
+    ;; parse flags: -d (detach), --rm, -e K=V
     (let [[flags rest-args]
           (loop [flags {} xs tail]
             (cond
               (empty? xs) [flags xs]
               (= "-d" (first xs))   (recur (assoc flags :detached? true) (rest xs))
               (= "--rm" (first xs)) (recur (assoc flags :rm? true) (rest xs))
+              (= "-e" (first xs))   (recur (update flags :extra-env
+                                                   (fn [e] (conj (or e []) (second xs))))
+                                           (drop 2 xs))
               :else [flags xs]))]
-      (if (< (count rest-args) 2)
-        (die "usage: lgcr run [-d] [--rm] <rootfs-dir> <command> [args...]")
+      (cond
+        (< (count rest-args) 1)
+        (die "usage: lgcr run [-d] [--rm] [-e K=V]... <image-or-rootfs> [command [args...]]")
+
+        :else
         (do-run (first rest-args)
-                (second rest-args)
+                (second rest-args)       ;; nil if not given
                 (vec (drop 2 rest-args))
                 flags)))
 
@@ -878,13 +956,9 @@
       (doseq [id tail] (do-start id)))
 
     (= subcmd "init")
-    (if (< (count tail) 4)
-      (die "usage: container.lg init <merged> <put-old> <hostname> <command> [args...]")
-      (do-init (nth tail 0)
-               (nth tail 1)
-               (nth tail 2)
-               (nth tail 3)
-               (vec (drop 4 tail))))
+    (if (< (count tail) 1)
+      (die "usage: lgcr init <id>  (internal)")
+      (do-init (first tail)))
 
     (= subcmd "pull")
     (if (< (count tail) 1)
