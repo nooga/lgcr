@@ -1,0 +1,242 @@
+;; Unit tests for lib.lg — pure helpers only.
+;; Run with: letgo tests/lib_test.lg  (from project root)
+
+(ns lgcr.lib-test
+  (:require [lib]
+            [test :refer [deftest is testing run-tests]]))
+
+;; ---------------------------------------------------------------------------
+;; pad-right
+;; ---------------------------------------------------------------------------
+
+(deftest pad-right-basic
+  (is (= "hi   " (lib/pad-right "hi" 5)))
+  (is (= "already-long" (lib/pad-right "already-long" 3)))
+  (is (= "" (lib/pad-right "" 0))))
+
+;; ---------------------------------------------------------------------------
+;; short-id
+;; ---------------------------------------------------------------------------
+
+(deftest short-id-takes-12-chars
+  (is (= "0123456789ab"
+         (lib/short-id "0123456789abcdef0123456789abcdef"))))
+
+;; ---------------------------------------------------------------------------
+;; numeric?
+;; ---------------------------------------------------------------------------
+
+(deftest numeric?-digits-only
+  (is (= true  (lib/numeric? "0")))
+  (is (= true  (lib/numeric? "1000")))
+  (is (= false (lib/numeric? "")))
+  (is (= false (lib/numeric? "12a")))
+  (is (= false (lib/numeric? "abc")))
+  (is (= false (lib/numeric? nil))))
+
+;; ---------------------------------------------------------------------------
+;; strip-nils
+;; ---------------------------------------------------------------------------
+
+(deftest strip-nils-drops-nil-entries
+  (is (= [] (lib/strip-nils [])))
+  (is (= [] (lib/strip-nils nil)))
+  (is (= [1 2 3] (lib/strip-nils [1 nil 2 nil 3])))
+  (is (= ["a"] (lib/strip-nils [nil "a" nil]))))
+
+;; ---------------------------------------------------------------------------
+;; split-short-flags
+;; ---------------------------------------------------------------------------
+
+(deftest split-short-flags-splits-combined
+  (is (= ["-a" "-b" "-c"]       (lib/split-short-flags ["-abc"])))
+  (is (= ["-a" "-q"]             (lib/split-short-flags ["-aq"])))
+  (is (= ["-a"]                  (lib/split-short-flags ["-a"])))
+  (is (= ["--rm"]                (lib/split-short-flags ["--rm"])))
+  (is (= ["arg" "-d"]            (lib/split-short-flags ["arg" "-d"])))
+  (is (= ["-a" "--rm" "-d" "-f"] (lib/split-short-flags ["-a" "--rm" "-df"])))
+  (is (= [] (lib/split-short-flags []))))
+
+;; ---------------------------------------------------------------------------
+;; env-has-key? / merge-env
+;; ---------------------------------------------------------------------------
+
+(deftest env-has-key?-matches-prefix
+  (is (= true  (lib/env-has-key? ["PATH=/bin" "HOME=/root"] "PATH")))
+  (is (= true  (lib/env-has-key? ["FOO=bar"] "FOO")))
+  (is (= false (lib/env-has-key? ["PATHX=y"] "PATH")))
+  (is (= false (lib/env-has-key? [] "PATH"))))
+
+(deftest merge-env-user-overrides-image
+  (let [image ["PATH=/bin" "HOME=/root"]
+        user  ["HOME=/home/me"]
+        out   (lib/merge-env image user)]
+    (is (some #(= "HOME=/home/me" %) out)
+        "user HOME should appear")
+    (is (not (some #(= "HOME=/root" %) out))
+        "image HOME should be suppressed")
+    (is (some #(= "PATH=/bin" %) out)
+        "image PATH survives when user doesnt override")))
+
+(deftest merge-env-adds-path-fallback
+  (let [out (lib/merge-env [] [])]
+    (is (some #(lib/env-has-key? [%] "PATH") out)
+        "PATH fallback injected when neither side set it")))
+
+(deftest merge-env-drops-nils
+  (let [out (lib/merge-env [nil "PATH=/bin"] [nil "HOME=/root"])]
+    (is (not (some nil? out))
+        "no nil entries remain in merged env")))
+
+;; ---------------------------------------------------------------------------
+;; parse-image-ref
+;; ---------------------------------------------------------------------------
+
+(deftest parse-image-ref-short-name
+  (let [{:keys [registry repo tag]} (lib/parse-image-ref "alpine")]
+    (is (= "registry-1.docker.io" registry))
+    (is (= "library/alpine" repo) "docker hub short names get library/ prefix")
+    (is (= "latest" tag) "default tag is latest")))
+
+(deftest parse-image-ref-with-tag
+  (let [{:keys [registry repo tag]} (lib/parse-image-ref "alpine:3.21")]
+    (is (= "library/alpine" repo))
+    (is (= "3.21" tag))))
+
+(deftest parse-image-ref-user-namespaced
+  (let [{:keys [repo tag]} (lib/parse-image-ref "bitnami/postgres:16")]
+    (is (= "bitnami/postgres" repo) "already-namespaced repos keep their org")
+    (is (= "16" tag))))
+
+(deftest parse-image-ref-custom-registry
+  (let [{:keys [registry repo tag]} (lib/parse-image-ref "ghcr.io/owner/app:v1")]
+    (is (= "ghcr.io" registry))
+    (is (= "owner/app" repo))
+    (is (= "v1" tag))))
+
+;; ---------------------------------------------------------------------------
+;; image-rootfs-dir
+;; ---------------------------------------------------------------------------
+
+(deftest image-rootfs-dir-slashes-become-underscores
+  (is (= "/tmp/letgo-rootfs/library_alpine-3.21"
+         (lib/image-rootfs-dir {:repo "library/alpine" :tag "3.21"}))))
+
+;; ---------------------------------------------------------------------------
+;; compose-command
+;; ---------------------------------------------------------------------------
+
+(def throw-err
+  (fn [m] (throw (str "compose-err: " m))))
+
+(deftest compose-command-user-cmd-prepended-with-entrypoint
+  (let [[c a] (lib/compose-command
+                {:entrypoint ["/docker-entrypoint.sh"]
+                 :cmd ["nginx" "-g" "daemon off;"]}
+                "cat" ["/etc/passwd"]
+                throw-err)]
+    (is (= "/docker-entrypoint.sh" c))
+    (is (= ["cat" "/etc/passwd"] a)
+        "user cmd overrides CMD, ENTRYPOINT still prepends")))
+
+(deftest compose-command-no-user-uses-cmd-default
+  (let [[c a] (lib/compose-command
+                {:entrypoint [] :cmd ["/bin/sh"]}
+                nil nil
+                throw-err)]
+    (is (= "/bin/sh" c))
+    (is (= [] a))))
+
+(deftest compose-command-entrypoint-plus-cmd
+  (let [[c a] (lib/compose-command
+                {:entrypoint ["/ep"] :cmd ["default-arg"]}
+                nil nil
+                throw-err)]
+    (is (= "/ep" c))
+    (is (= ["default-arg"] a))))
+
+(deftest compose-command-strips-nils-from-entrypoint
+  (let [[c a] (lib/compose-command
+                {:entrypoint [nil] :cmd ["/bin/sh"]}
+                nil nil
+                throw-err)]
+    (is (= "/bin/sh" c))
+    (is (= [] a) "nil entrypoint stripped cleanly")))
+
+;; ---------------------------------------------------------------------------
+;; parse-signal
+;; ---------------------------------------------------------------------------
+
+(deftest parse-signal-defaults-to-term
+  (is (= 15 (lib/parse-signal nil throw-err))))
+
+(deftest parse-signal-accepts-names
+  (is (= 9  (lib/parse-signal "KILL" throw-err)))
+  (is (= 9  (lib/parse-signal "SIGKILL" throw-err)))
+  (is (= 15 (lib/parse-signal "TERM" throw-err)))
+  (is (= 2  (lib/parse-signal "INT" throw-err)))
+  (is (= 28 (lib/parse-signal "WINCH" throw-err))))
+
+(deftest parse-signal-accepts-numbers
+  (is (= 7 (lib/parse-signal "7" throw-err))))
+
+;; ---------------------------------------------------------------------------
+;; humanize-ago
+;; ---------------------------------------------------------------------------
+
+(deftest humanize-ago-various
+  (is (= "just now"      (lib/humanize-ago -1)))
+  (is (= "0 seconds"     (lib/humanize-ago 0)))
+  (is (= "1 second"      (lib/humanize-ago 1)))
+  (is (= "59 seconds"    (lib/humanize-ago 59)))
+  (is (= "1 minute"      (lib/humanize-ago 60)))
+  (is (= "2 minutes"     (lib/humanize-ago 120)))
+  (is (= "1 hour"        (lib/humanize-ago 3600)))
+  (is (= "3 hours"       (lib/humanize-ago 10800)))
+  (is (= "1 day"         (lib/humanize-ago 86400)))
+  (is (= "5 days"        (lib/humanize-ago (* 5 86400)))))
+
+;; ---------------------------------------------------------------------------
+;; format-cmd
+;; ---------------------------------------------------------------------------
+
+(deftest format-cmd-joins-args
+  (is (= "sleep 30"
+         (lib/format-cmd {:command "sleep" :args ["30"]})))
+  (is (= "echo"
+         (lib/format-cmd {:command "echo" :args []})))
+  (is (= "sh -c echo hi"
+         (lib/format-cmd {:command "sh" :args ["-c" "echo hi"]}))))
+
+;; ---------------------------------------------------------------------------
+;; render-status
+;; ---------------------------------------------------------------------------
+
+(deftest render-status-running
+  (is (= "Up 5 seconds"
+         (lib/render-status
+           {:effective-status "running" :started-epoch 95}
+           100))))
+
+(deftest render-status-exited
+  (is (= "Exited (0) 30 seconds ago"
+         (lib/render-status
+           {:effective-status "exited" :exit-code 0 :finished-epoch 70}
+           100))))
+
+(deftest render-status-killed-with-signal
+  (is (= "Killed (signal 15) 5 seconds ago"
+         (lib/render-status
+           {:effective-status "killed" :signal 15 :finished-epoch 95}
+           100))))
+
+(deftest render-status-created
+  (is (= "Created"
+         (lib/render-status {:effective-status "created"} 100))))
+
+;; ---------------------------------------------------------------------------
+;; main
+;; ---------------------------------------------------------------------------
+
+(run-tests)
+(when-not test/*test-result* (os/exit 1))

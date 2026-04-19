@@ -1,0 +1,217 @@
+;; lib.lg — pure helpers used by container.lg.
+;; Kept separate so the test harness can load them without executing the CLI
+;; dispatcher at the bottom of container.lg.
+;;
+;; Nothing in here may touch the filesystem, spawn processes, or read env
+;; vars. Everything is string/collection/number manipulation.
+
+(ns lib
+  (:require [string]))
+
+;; ---------------------------------------------------------------------------
+;; constants
+;; ---------------------------------------------------------------------------
+
+(def HEX-CHARS "0123456789abcdef")
+
+(def DEFAULT-PATH
+  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+
+(def SHORT-ID-LEN 12)
+
+;; ---------------------------------------------------------------------------
+;; id helpers
+;; ---------------------------------------------------------------------------
+
+(defn short-id [id] (subs id 0 SHORT-ID-LEN))
+
+;; ---------------------------------------------------------------------------
+;; string / collection
+;; ---------------------------------------------------------------------------
+
+(defn pad-right [s n]
+  (let [extra (- n (count s))]
+    (if (pos? extra) (str s (apply str (repeat extra " "))) s)))
+
+(defn path-join [& parts]
+  (string/join "/" parts))
+
+(defn numeric? [s]
+  (and (string? s) (pos? (count s))
+       (reduce (fn [acc c]
+                 (and acc (>= (int c) (int \0)) (<= (int c) (int \9))))
+               true (seq s))))
+
+(defn strip-nils
+  "Drop nil entries; JSON null in an array lands as nil after decode."
+  [xs]
+  (reduce (fn [acc x] (if (nil? x) acc (conj acc x))) [] (or xs [])))
+
+(defn split-short-flags
+  "Rewrite combined short flags (-abc → -a -b -c).
+   Leaves long flags (--foo), single-char flags (-a), and non-flags alone."
+  [args]
+  (reduce (fn [acc x]
+            (cond
+              (or (not (string/starts-with? x "-"))
+                  (string/starts-with? x "--")
+                  (<= (count x) 2))
+              (conj acc x)
+              :else
+              (reduce (fn [a c] (conj a (str "-" c)))
+                      acc
+                      (seq (subs x 1)))))
+          []
+          args))
+
+;; ---------------------------------------------------------------------------
+;; env helpers
+;; ---------------------------------------------------------------------------
+
+(defn env-has-key?
+  "Check whether an env vector (of \"K=V\" strings) already sets K."
+  [env k]
+  (let [prefix (str k "=")]
+    (reduce (fn [acc e]
+              (or acc
+                  (and (string? e) (string/starts-with? e prefix))))
+            false env)))
+
+(defn merge-env
+  "Left-biased: keys present in `user` override `image`. A PATH default is
+   appended if neither side sets it. Non-string entries are dropped."
+  [image user]
+  (let [clean (fn [xs]
+                (reduce (fn [acc e] (if (string? e) (conj acc e) acc)) [] (or xs [])))
+        image (clean image)
+        user  (clean user)
+        combined (reduce (fn [acc e]
+                           (let [k (first (string/split e "="))]
+                             (if (env-has-key? acc k)
+                               acc
+                               (conj acc e))))
+                         user
+                         image)]
+    (if (env-has-key? combined "PATH")
+      combined
+      (conj combined (str "PATH=" DEFAULT-PATH)))))
+
+;; ---------------------------------------------------------------------------
+;; image-ref parsing
+;; ---------------------------------------------------------------------------
+
+(defn parse-image-ref
+  "Parse 'library/alpine:3.21' or 'alpine' into {:registry :repo :tag}.
+   Docker Hub short names get an implicit 'library/' prefix."
+  [ref]
+  (let [parts         (string/split ref "/")
+        has-registry? (and (> (count parts) 1)
+                           (or (string/includes? (first parts) ".")
+                               (string/includes? (first parts) ":")))
+        registry      (if has-registry? (first parts) "registry-1.docker.io")
+        repo-tag      (if has-registry? (string/join "/" (rest parts)) ref)
+        rt-parts      (string/split repo-tag ":")
+        repo          (first rt-parts)
+        tag           (if (> (count rt-parts) 1) (second rt-parts) "latest")
+        repo          (if (and (= registry "registry-1.docker.io")
+                               (not (string/includes? repo "/")))
+                        (str "library/" repo)
+                        repo)]
+    {:registry registry :repo repo :tag tag}))
+
+(defn image-rootfs-dir
+  "Conventional on-disk rootfs path for a parsed image ref."
+  [parsed]
+  (str "/tmp/letgo-rootfs/"
+       (string/replace (:repo parsed) "/" "_")
+       "-" (:tag parsed)))
+
+;; ---------------------------------------------------------------------------
+;; command composition (OCI ENTRYPOINT/CMD semantics)
+;; ---------------------------------------------------------------------------
+
+(defn compose-command
+  "Compose the final argv from image config + user input.
+   Returns [command args], or throws if neither side supplied a command."
+  [config user-cmd user-args on-err]
+  (let [ep       (strip-nils (:entrypoint config))
+        cfg-cmd  (strip-nils (:cmd config))
+        combined (cond
+                   user-cmd (into ep (into [user-cmd] user-args))
+                   (or (seq ep) (seq cfg-cmd)) (into ep cfg-cmd)
+                   :else nil)]
+    (if (nil? combined)
+      (on-err "no command: image has no ENTRYPOINT or CMD and none was given")
+      [(first combined) (vec (rest combined))])))
+
+;; ---------------------------------------------------------------------------
+;; signal name → number
+;; ---------------------------------------------------------------------------
+
+(def SIGNAL-NUMBERS
+  {"HUP" 1  "SIGHUP" 1
+   "INT" 2  "SIGINT" 2
+   "QUIT" 3 "SIGQUIT" 3
+   "KILL" 9 "SIGKILL" 9
+   "TERM" 15 "SIGTERM" 15
+   "CHLD" 17 "SIGCHLD" 17
+   "WINCH" 28 "SIGWINCH" 28})
+
+(defn parse-signal
+  "Resolve a signal spec (name or number-as-string) to an integer.
+   Default is 15 (TERM) when nil."
+  [s on-err]
+  (cond
+    (nil? s) 15
+    (get SIGNAL-NUMBERS s) (get SIGNAL-NUMBERS s)
+    :else (let [n (try (parse-int s) (catch e nil))]
+            (or n (on-err (str "unknown signal: " s))))))
+
+;; ---------------------------------------------------------------------------
+;; time formatting
+;; ---------------------------------------------------------------------------
+
+(defn humanize-ago
+  "Format a duration (seconds) docker-style: '5 seconds', '2 minutes', etc."
+  [secs]
+  (cond
+    (< secs 0)     "just now"
+    (< secs 60)    (str secs " second" (if (= secs 1) "" "s"))
+    (< secs 3600)  (let [m (int (/ secs 60))]
+                     (str m " minute" (if (= m 1) "" "s")))
+    (< secs 86400) (let [h (int (/ secs 3600))]
+                     (str h " hour" (if (= h 1) "" "s")))
+    :else          (let [d (int (/ secs 86400))]
+                     (str d " day" (if (= d 1) "" "s")))))
+
+(defn format-cmd
+  "Render command + args for display."
+  [state]
+  (let [c (:command state)
+        a (:args state)]
+    (if (seq a)
+      (str c " " (string/join " " a))
+      (str c))))
+
+(defn render-status
+  "Docker-style status column for ps, given a state map and current epoch."
+  [state now-e]
+  (let [eff (:effective-status state)
+        dur (fn [t] (when t (humanize-ago (- now-e t))))]
+    (cond
+      (= "running" eff)
+      (str "Up " (or (dur (:started-epoch state)) "a moment"))
+
+      (= "exited" eff)
+      (str "Exited (" (:exit-code state) ") "
+           (or (dur (:finished-epoch state)) "just now") " ago")
+
+      (= "killed" eff)
+      (str "Killed"
+           (when-let [s (:signal state)] (str " (signal " s ")"))
+           " " (or (dur (:finished-epoch state)) "just now") " ago")
+
+      (= "created" eff) "Created"
+      (= "dead" eff)
+      (str "Dead (lost pid " (:pid state) ")")
+      :else eff)))

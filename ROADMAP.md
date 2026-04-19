@@ -3,6 +3,22 @@
 Where lgcr is going, loosely ordered. Each milestone is a coherent stopping
 point — the tool is more useful after each one than before.
 
+## Test suite
+
+`./tests/run.sh` does the full bundle + unit + e2e loop.
+
+- **Unit** (`tests/lib_test.lg`): covers pure helpers in `lib.lg` using let-go's
+  `test` ns. 27 tests / 70+ assertions. Runs on the host with the host-built
+  `lg`.
+- **E2E** (`tests/e2e.sh`): exercises the real `lgcr` binary inside the Lima
+  VM. Covers foreground run, detached shim, logs, ps (flags + combined short
+  flags), stop/kill (signal forwarding + propagated status), rm (refusal +
+  force), start (respawn), inspect, image-ref run with env/workdir, and
+  prefix-id ambiguity.
+
+New pure helpers go in `lib.lg` so they're testable in isolation —
+`container.lg` only holds things that touch filesystem / processes / env.
+
 ## Current state
 
 - `pull`: real OCI registry client (manifest list resolution, token auth, streaming layer download)
