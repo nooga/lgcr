@@ -35,6 +35,25 @@
 (defn exists? [path]
   (not (nil? (os/stat path))))
 
+(defn split-short-flags
+  "Rewrite combined short flags (e.g. -aq → -a -q) before a flag parser runs.
+   Leaves long flags (--rm), single-char flags (-a), and non-flags untouched."
+  [args]
+  (reduce (fn [acc x]
+            (cond
+              ;; long flags (--foo) or non-flag
+              (or (not (string/starts-with? x "-"))
+                  (string/starts-with? x "--")
+                  (<= (count x) 2))
+              (conj acc x)
+              :else
+              ;; -abc → -a -b -c
+              (reduce (fn [a c] (conj a (str "-" c)))
+                      acc
+                      (seq (subs x 1)))))
+          []
+          args))
+
 ;; ---------------------------------------------------------------------------
 ;; state store (XDG-rooted, per-container dir)
 ;; ---------------------------------------------------------------------------
@@ -63,6 +82,28 @@
 (defn now-iso []
   ;; os/sh is cheap enough for this low-frequency path
   (string/trim (:out (os/sh "date" "-u" "+%Y-%m-%dT%H:%M:%SZ"))))
+
+(defn now-epoch []
+  (parse-int (string/trim (:out (os/sh "date" "+%s")))))
+
+(defn now-stamp
+  "A map of {:iso ... :epoch ...} written alongside state transitions."
+  []
+  {:iso (now-iso) :epoch (now-epoch)})
+
+(defn humanize-ago
+  "Format a duration (seconds) like docker: '5 seconds', '2 minutes', '3 hours',
+   '4 days'."
+  [secs]
+  (cond
+    (< secs 0)       "just now"
+    (< secs 60)      (str secs " second" (if (= secs 1) "" "s"))
+    (< secs 3600)    (let [m (int (/ secs 60))]
+                       (str m " minute" (if (= m 1) "" "s")))
+    (< secs 86400)   (let [h (int (/ secs 3600))]
+                       (str h " hour" (if (= h 1) "" "s")))
+    :else            (let [d (int (/ secs 86400))]
+                       (str d " day" (if (= d 1) "" "s")))))
 
 (defn list-container-ids []
   (let [dir (str (state-root) "/containers")]
@@ -239,6 +280,58 @@
       combined
       (conj combined (str "PATH=" DEFAULT-PATH)))))
 
+(defn numeric? [s]
+  (and (string? s) (pos? (count s))
+       (reduce (fn [acc c]
+                 (and acc (>= (int c) (int \0)) (<= (int c) (int \9))))
+               true (seq s))))
+
+(defn lookup-passwd
+  "Find entry for username in /etc/passwd. Returns {:uid N :gid N} or nil."
+  [name]
+  (try
+    (let [lines (string/split (slurp "/etc/passwd") "\n")]
+      (reduce (fn [acc l]
+                (if acc acc
+                    (let [parts (string/split l ":")]
+                      (if (and (>= (count parts) 4) (= name (first parts)))
+                        {:uid (parse-int (nth parts 2))
+                         :gid (parse-int (nth parts 3))}
+                        nil))))
+              nil lines))
+    (catch e nil)))
+
+(defn lookup-group
+  "Find gid for group name in /etc/group, or nil."
+  [name]
+  (try
+    (let [lines (string/split (slurp "/etc/group") "\n")]
+      (reduce (fn [acc l]
+                (if acc acc
+                    (let [parts (string/split l ":")]
+                      (if (and (>= (count parts) 3) (= name (first parts)))
+                        (parse-int (nth parts 2))
+                        nil))))
+              nil lines))
+    (catch e nil)))
+
+(defn resolve-user
+  "Parse a USER spec ('user', 'user:group', '1000', '1000:1000') and return
+   {:uid N :gid N} using /etc/passwd and /etc/group as needed. Empty/nil → nil."
+  [spec]
+  (when (and spec (not= "" spec))
+    (let [[u g] (string/split spec ":")
+          user-info (cond
+                      (numeric? u) {:uid (parse-int u) :gid (parse-int u)}
+                      :else (or (lookup-passwd u)
+                                (die "user not found: " u)))
+          gid (cond
+                (nil? g)      (:gid user-info)
+                (numeric? g)  (parse-int g)
+                :else         (or (lookup-group g)
+                                  (die "group not found: " g)))]
+      {:uid (:uid user-info) :gid gid})))
+
 (defn resolve-bin
   "Find an executable: absolute path, or scan a few common dirs."
   [cmd]
@@ -286,6 +379,11 @@
     (syscall/sethostname hostname)
     (when (and workdir (not= "" workdir))
       (try (syscall/chdir workdir) (catch e nil)))
+
+    ;; drop privileges if USER was set on the image (or explicitly)
+    (when-let [creds (resolve-user (:user state))]
+      (syscall/setgid (:gid creds))
+      (syscall/setuid (:uid creds)))
 
     (let [bin  (resolve-bin cmd)
           argv (into [bin] args)
@@ -374,25 +472,29 @@
     (println (str "[lgcr] id=" (short-id container-id)))
     (println (str "[lgcr] rootfs=" (:merged rootfs)))
 
-    (update-state container-id assoc
-                  :status "running"
-                  :started (now-iso)
-                  :cgroup cg-path
-                  :rootfs-merged (:merged rootfs)
-                  :run-dir (:run-dir rootfs))
+    (let [started (now-stamp)]
+      (update-state container-id assoc
+                    :status "running"
+                    :started (:iso started)
+                    :started-epoch (:epoch started)
+                    :cgroup cg-path
+                    :rootfs-merged (:merged rootfs)
+                    :run-dir (:run-dir rootfs)))
 
     (let [res  (syscall/spawn-async (first argv) argv (child-env) cloneflags
                                      *in* *out* *err*)
           _    (update-state container-id assoc :pid (:pid res))
           wr   (syscall/waitpid (:pid res) 0)
           exit (:status wr)
-          sg   (:signal wr)]
+          sg   (:signal wr)
+          fin  (now-stamp)]
 
       (update-state container-id assoc
                     :status    (if (pos? sg) "killed" "exited")
                     :exit-code exit
                     :signal    (when (pos? sg) sg)
-                    :finished  (now-iso))
+                    :finished  (:iso fin)
+                    :finished-epoch (:epoch fin))
 
       (println)
       (println (str "[lgcr] container exited with status " exit))
@@ -470,25 +572,30 @@
 
     ;; initial state.json (everything the shim needs)
     (syscall/mkdir-p (container-dir container-id) 0755)
-    (write-state {:id         container-id
-                  :status     "created"
-                  :rootfs-src rootfs
-                  :image      (when config target)
-                  :command    command
-                  :args       args
-                  :hostname   hostname
-                  :workdir    (or (:workdir config) "")
-                  :env-image  (or (:env config) [])
-                  :env        (or (:extra-env opts) [])
-                  :limits     limits
-                  :detached?  (boolean detached?)
-                  :rm?        (boolean (:rm? opts))
-                  :created    (now-iso)
-                  :pid        nil
-                  :exit-code  nil
-                  :signal     nil
-                  :started    nil
-                  :finished   nil})
+    (let [stamp (now-stamp)]
+      (write-state {:id            container-id
+                    :status        "created"
+                    :rootfs-src    rootfs
+                    :image         (when config target)
+                    :command       command
+                    :args          args
+                    :hostname      hostname
+                    :workdir       (or (:workdir config) "")
+                    :user          (or (:user config) "")
+                    :env-image     (or (:env config) [])
+                    :env           (or (:extra-env opts) [])
+                    :limits        limits
+                    :detached?     (boolean detached?)
+                    :rm?           (boolean (:rm? opts))
+                    :created       (:iso stamp)
+                    :created-epoch (:epoch stamp)
+                    :pid           nil
+                    :exit-code     nil
+                    :signal        nil
+                    :started       nil
+                    :started-epoch nil
+                    :finished      nil
+                    :finished-epoch nil}))
 
     (if detached?
       (do-run-detached container-id)
@@ -518,19 +625,22 @@
         cloneflags (bit-or (bit-or syscall/CLONE_NEWNS  syscall/CLONE_NEWPID)
                            (bit-or syscall/CLONE_NEWUTS syscall/CLONE_NEWIPC))]
 
-    (update-state container-id assoc
-                  :status "running"
-                  :started (now-iso)
-                  :cgroup cg-path
-                  :rootfs-merged (:merged rootfs)
-                  :run-dir (:run-dir rootfs))
+    (let [started (now-stamp)]
+      (update-state container-id assoc
+                    :status "running"
+                    :started (:iso started)
+                    :started-epoch (:epoch started)
+                    :cgroup cg-path
+                    :rootfs-merged (:merged rootfs)
+                    :run-dir (:run-dir rootfs)))
 
     (let [res  (syscall/spawn-async (first argv) argv (child-env) cloneflags
                                     nil stdout-h stderr-h)
           _    (update-state container-id assoc :pid (:pid res))
           wr   (syscall/waitpid (:pid res) 0)
           exit (:status wr)
-          sg   (:signal wr)]
+          sg   (:signal wr)
+          fin  (now-stamp)]
 
       (close! stdout-h)
       (close! stderr-h)
@@ -539,7 +649,8 @@
                     :status    (if (pos? sg) "killed" "exited")
                     :exit-code exit
                     :signal    (when (pos? sg) sg)
-                    :finished  (now-iso))
+                    :finished  (:iso fin)
+                    :finished-epoch (:epoch fin))
 
       (cleanup-container rootfs cg-path)
       (when (:rm? (read-state container-id))
@@ -585,6 +696,30 @@
       (str c " " (string/join " " a))
       (str c))))
 
+(defn render-status
+  "Docker-style status: 'Up 5 seconds' / 'Exited (0) 1 minute ago' /
+   'Killed (SIGTERM) 30 seconds ago' / 'Created'."
+  [state now-e]
+  (let [eff (:effective-status state)
+        dur (fn [t] (when t (humanize-ago (- now-e t))))]
+    (cond
+      (= "running" eff)
+      (str "Up " (or (dur (:started-epoch state)) "a moment"))
+
+      (= "exited" eff)
+      (str "Exited (" (:exit-code state) ") "
+           (or (dur (:finished-epoch state)) "just now") " ago")
+
+      (= "killed" eff)
+      (str "Killed"
+           (when-let [s (:signal state)] (str " (signal " s ")"))
+           " " (or (dur (:finished-epoch state)) "just now") " ago")
+
+      (= "created" eff) "Created"
+      (= "dead" eff)
+      (str "Dead (lost pid " (:pid state) ")")
+      :else eff)))
+
 (defn do-ps [opts]
   (let [all?   (:all? opts)
         quiet? (:quiet? opts)
@@ -598,25 +733,26 @@
                                 (if st (conj acc st) acc)))
                             [])
                     (filter (fn [s] (or all?
-                                        (= "running" (:effective-status s))))))]
+                                        (= "running" (:effective-status s))))))
+        now-e  (now-epoch)]
     (cond
       quiet?
       (doseq [s rows]
         (println (short-id (:id s))))
 
       (empty? rows)
-      nil  ;; docker prints just the header; we stay silent to keep grep-able
+      nil  ;; keep grep-friendly
 
       :else
       (do
         (println (str (pad-right "ID" 14)
-                      (pad-right "STATUS" 10)
+                      (pad-right "STATUS" 32)
                       (pad-right "CREATED" 22)
                       "COMMAND"))
         (doseq [s rows]
           (println (str (pad-right (short-id (:id s)) 14)
-                        (pad-right (:effective-status s) 10)
-                        (pad-right (str (:created s)) 22)
+                        (pad-right (render-status s now-e) 32)
+                        (pad-right (str (humanize-ago (- now-e (:created-epoch s))) " ago") 22)
                         (format-cmd s))))))))
 
 ;; ---------------------------------------------------------------------------
@@ -707,7 +843,9 @@
                            :exit-code nil
                            :signal nil
                            :started nil
-                           :finished nil)))
+                           :started-epoch nil
+                           :finished nil
+                           :finished-epoch nil)))
     ;; spawn a fresh shim
     (let [argv (into (self-prefix) ["shim" id])
           shim-err (open (str (container-dir id) "/shim.log") :write)
@@ -865,7 +1003,7 @@
     (= subcmd "run")
     ;; parse flags: -d (detach), --rm, -e K=V
     (let [[flags rest-args]
-          (loop [flags {} xs tail]
+          (loop [flags {} xs (split-short-flags tail)]
             (cond
               (empty? xs) [flags xs]
               (= "-d" (first xs))   (recur (assoc flags :detached? true) (rest xs))
@@ -891,7 +1029,7 @@
 
     (= subcmd "logs")
     (let [[flags rest-args]
-          (loop [flags {} xs tail]
+          (loop [flags {} xs (split-short-flags tail)]
             (cond
               (empty? xs) [flags xs]
               (= "-f" (first xs)) (recur (assoc flags :follow? true) (rest xs))
@@ -901,7 +1039,7 @@
         (do-logs (first rest-args) (:follow? flags))))
 
     (= subcmd "ps")
-    (let [flags (loop [f {} xs tail]
+    (let [flags (loop [f {} xs (split-short-flags tail)]
                   (cond
                     (empty? xs) f
                     (= "-a" (first xs)) (recur (assoc f :all? true) (rest xs))
@@ -911,7 +1049,7 @@
 
     (= subcmd "stop")
     (let [[flags rest-args]
-          (loop [f {} xs tail]
+          (loop [f {} xs (split-short-flags tail)]
             (cond
               (empty? xs) [f xs]
               (= "-t" (first xs)) (recur (assoc f :grace (parse-int (second xs)))
@@ -924,7 +1062,7 @@
 
     (= subcmd "kill")
     (let [[flags rest-args]
-          (loop [f {} xs tail]
+          (loop [f {} xs (split-short-flags tail)]
             (cond
               (empty? xs) [f xs]
               (= "-s" (first xs)) (recur (assoc f :signal (second xs)) (drop 2 xs))
@@ -936,7 +1074,7 @@
 
     (= subcmd "rm")
     (let [[flags rest-args]
-          (loop [f {} xs tail]
+          (loop [f {} xs (split-short-flags tail)]
             (cond
               (empty? xs) [f xs]
               (= "-f" (first xs)) (recur (assoc f :force? true) (rest xs))
