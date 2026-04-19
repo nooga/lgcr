@@ -118,9 +118,14 @@
 ;; image-rootfs-dir
 ;; ---------------------------------------------------------------------------
 
-(deftest image-rootfs-dir-slashes-become-underscores
-  (is (= "/tmp/letgo-rootfs/library_alpine-3.21"
-         (lib/image-rootfs-dir {:repo "library/alpine" :tag "3.21"}))))
+(deftest image-subdir-slashes-become-underscores
+  (is (= "library_alpine-3.21"
+         (lib/image-subdir {:repo "library/alpine" :tag "3.21"}))))
+
+(deftest image-rootfs-dir-joins-root
+  (is (= "/var/lib/lgcr/images/library_alpine-3.21"
+         (lib/image-rootfs-dir "/var/lib/lgcr/images"
+                               {:repo "library/alpine" :tag "3.21"}))))
 
 ;; ---------------------------------------------------------------------------
 ;; compose-command
@@ -183,6 +188,16 @@
 ;; ---------------------------------------------------------------------------
 ;; humanize-ago
 ;; ---------------------------------------------------------------------------
+
+(deftest humanize-bytes-various
+  (is (= "?"      (lib/humanize-bytes nil)))
+  (is (= "0B"     (lib/humanize-bytes 0)))
+  (is (= "512B"   (lib/humanize-bytes 512)))
+  (is (= "1kB"    (lib/humanize-bytes 1024)))
+  (is (= "3.1kB"  (lib/humanize-bytes 3200)))
+  (is (= "1MB"    (lib/humanize-bytes 1048576)))
+  (is (= "7.7MB"  (lib/humanize-bytes 8100000)))
+  (is (= "1GB"    (lib/humanize-bytes 1073741824))))
 
 (deftest humanize-ago-various
   (is (= "just now"      (lib/humanize-ago -1)))

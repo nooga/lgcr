@@ -119,12 +119,16 @@
                         repo)]
     {:registry registry :repo repo :tag tag}))
 
-(defn image-rootfs-dir
-  "Conventional on-disk rootfs path for a parsed image ref."
+(defn image-subdir
+  "Leaf directory name for an image's rootfs inside the image store."
   [parsed]
-  (str "/tmp/letgo-rootfs/"
-       (string/replace (:repo parsed) "/" "_")
-       "-" (:tag parsed)))
+  (str (string/replace (:repo parsed) "/" "_") "-" (:tag parsed)))
+
+(defn image-rootfs-dir
+  "Full on-disk path for a parsed image ref, given the image store root.
+   TEMPORARY: flat per-ref layout — will be replaced by the CAS store in M8."
+  [root parsed]
+  (str root "/" (image-subdir parsed)))
 
 ;; ---------------------------------------------------------------------------
 ;; command composition (OCI ENTRYPOINT/CMD semantics)
@@ -170,6 +174,16 @@
 ;; ---------------------------------------------------------------------------
 ;; time formatting
 ;; ---------------------------------------------------------------------------
+
+(defn humanize-bytes
+  "Format a byte count docker-style: '3.1kB', '12.4MB', '1.2GB'."
+  [n]
+  (cond
+    (nil? n)          "?"
+    (< n 1024)        (str n "B")
+    (< n 1048576)     (str (/ (int (/ (* n 10) 1024)) 10.0) "kB")
+    (< n 1073741824)  (str (/ (int (/ (* n 10) 1048576)) 10.0) "MB")
+    :else             (str (/ (int (/ (* n 10) 1073741824)) 10.0) "GB")))
 
 (defn humanize-ago
   "Format a duration (seconds) docker-style: '5 seconds', '2 minutes', etc."

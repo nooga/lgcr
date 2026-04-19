@@ -240,8 +240,12 @@ Arrives after the runtime is solid, because the build reuses the runtime.
 
 ## M8 — storage, images, polish
 
-- Content-addressable layer store instead of `/tmp/letgo-rootfs/<name>`
-- Image garbage collection
+- **Interim (done)**: flat per-ref image store moved to
+  `$XDG_DATA_HOME/lgcr/images/` (survives reboot); `images` + `rmi`
+  subcommands; `run` auto-pulls. This is scaffolding — replaced by:
+- Content-addressable layer store (blobs keyed by sha256, refs → manifest
+  digests, layers shared across images via overlay)
+- Image garbage collection (refcount layers, prune orphans)
 - `pull` resume on partial layers
 - Signature verification (cosign / sigstore) — optional
 - Robust cleanup on crash (state dir reconciliation on startup)

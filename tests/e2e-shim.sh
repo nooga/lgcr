@@ -73,7 +73,9 @@ expect_contains "$OUT" "brew install lima" "suggests the fix"
 
 section "shim forwards ps output identically to direct linux call"
 for id in $("$SHIM" ps -aq 2>/dev/null); do "$SHIM" rm -f "$id" > /dev/null || true; done
-CID=$("$SHIM" run -d alpine:3.21 sleep 30)
+# Pre-pull so `run -d` output is exactly the id (auto-pull prints [pull] lines).
+"$SHIM" pull alpine:3.21 > /dev/null 2>&1
+CID=$("$SHIM" run -d alpine:3.21 sleep 30 | tail -1)
 sleep 0.4
 SHIM_OUT=$("$SHIM" ps | head -3)
 LINUX_OUT=$(limactl shell letgo sudo "$LBIN" ps | head -3)

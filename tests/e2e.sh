@@ -99,7 +99,7 @@ for _id in $("$LGCR" ps -aq 2>/dev/null); do
     "$LGCR" rm -f "$_id" > /dev/null 2>&1 || true
 done
 
-if [ ! -d "/tmp/letgo-rootfs/library_${IMG/:/-}" ]; then
+if ! "$LGCR" images -q 2>/dev/null | grep -qF "library/${IMG/:/:}"; then
     echo "=== pulling $IMG (one-time) ==="
     "$LGCR" pull "$IMG" > /dev/null
 fi
@@ -284,17 +284,12 @@ expect_contains "$OUT" "at least 2 characters" "min-prefix enforced"
 "$LGCR" rm -f "${CA:0:6}" "${CB:0:6}" > /dev/null
 
 section "run auto-pulls a missing image"
-# /tmp/letgo-rootfs lives on the Linux side (inside Lima). From the darwin
-# shim path, `rm` on the mac host would be a no-op, so skip that wipe when
-# we're not on Linux.
-if [ "$(uname)" = "Linux" ]; then
-    rm -rf /tmp/letgo-rootfs/library_hello-world-latest
-fi
+# Wipe hello-world from the image store via the tool (works through the
+# darwin shim too, since it forwards into Lima).
+"$LGCR" rmi -f hello-world > /dev/null 2>&1 || true
 OUT=$("$LGCR" run --rm hello-world 2>&1)
 expect_contains "$OUT" "Hello from Docker!" "scratch-image binary ran to completion"
-if [ "$(uname)" = "Linux" ]; then
-    expect_contains "$OUT" "[pull]" "pull progress emitted on cold cache"
-fi
+expect_contains "$OUT" "[pull]" "pull progress emitted on cold cache"
 
 section "scratch rootfs (no /bin/rm) does not kill init"
 # Regression: sh! on /.pivot_old used to fail on scratch images and leave a
@@ -302,6 +297,74 @@ section "scratch rootfs (no /bin/rm) does not kill init"
 OUT=$("$LGCR" run --rm hello-world 2>&1)
 expect_contains "$OUT" "Hello from Docker!" "second run also succeeds"
 expect_not_contains "$OUT" "control socket never ready" "no stale-socket error"
+
+section "images lists pulled images"
+OUT=$("$LGCR" images 2>&1)
+expect_contains "$OUT" "IMAGE" "header printed"
+expect_contains "$OUT" "hello-world" "hello-world appears"
+OUT=$("$LGCR" images -q 2>&1)
+expect_contains "$OUT" "hello-world" "-q shows refs"
+expect_not_contains "$OUT" "IMAGE" "-q omits header"
+
+section "rmi refuses to remove an image used by a container"
+CID=$("$LGCR" run -d "$IMG" sleep 30 2>&1 | tail -1)
+sleep 1
+OUT=$("$LGCR" rmi "$IMG" 2>&1 || true)
+expect_contains "$OUT" "used by" "refuses while a container references it"
+"$LGCR" rm -f "${CID:0:6}" > /dev/null
+
+section "prune --containers removes stopped containers only"
+# Start from a clean container slate — earlier tests in this file leave the
+# original `CID` running (sleep 30) and its lifecycle is timing-dependent
+# by the time we get here. A full rm -f'up-front makes this deterministic.
+for _id in $("$LGCR" ps -aq 2>/dev/null); do
+    "$LGCR" rm -f "$_id" > /dev/null 2>&1 || true
+done
+# Make one stopped container (run a quick command) and one running.
+"$LGCR" run "$IMG" sh -c 'true' > /dev/null 2>&1
+RUN_CID=$("$LGCR" run -d "$IMG" sleep 30 2>&1 | tail -1)
+sleep 1
+BEFORE_ALL=$("$LGCR" ps -aq | wc -l | tr -d ' ')
+BEFORE_RUNNING=$("$LGCR" ps -q | wc -l | tr -d ' ')
+OUT=$("$LGCR" prune --containers 2>&1)
+expect_contains "$OUT" "pruned" "prune summary printed"
+expect_contains "$OUT" "reclaimed" "reports reclaimed space"
+AFTER_ALL=$("$LGCR" ps -aq | wc -l | tr -d ' ')
+AFTER_RUNNING=$("$LGCR" ps -q | wc -l | tr -d ' ')
+expect_eq "$AFTER_RUNNING" "$BEFORE_RUNNING" "running containers untouched"
+# At least one stopped container was removed
+if [ "$AFTER_ALL" -lt "$BEFORE_ALL" ]; then
+    PASS=$((PASS + 1)); echo "  ok  stopped container count dropped"
+else
+    FAIL=$((FAIL + 1)); echo "  FAIL stopped not pruned: $BEFORE_ALL -> $AFTER_ALL"
+fi
+"$LGCR" rm -f "${RUN_CID:0:6}" > /dev/null
+
+section "prune --images removes unused images only"
+"$LGCR" pull hello-world > /dev/null 2>&1
+OUT=$("$LGCR" prune --images 2>&1)
+expect_contains "$OUT" "removed image" "reports each removed image"
+OUT=$("$LGCR" images -q 2>&1 || true)
+expect_not_contains "$OUT" "hello-world" "hello-world pruned"
+# IMG is still present because we just used it above (and may be referenced
+# by still-stopped containers). We don't assert on its presence — the prune
+# above cleared containers, so it may or may not survive; both are fine.
+
+section "prune (no flags) wipes both"
+"$LGCR" run "$IMG" sh -c 'true' > /dev/null 2>&1
+"$LGCR" pull hello-world > /dev/null 2>&1
+sleep 1
+OUT=$("$LGCR" prune 2>&1)
+expect_contains "$OUT" "pruned" "default prunes both"
+sleep 1
+expect_eq "$("$LGCR" ps -aq | wc -l | tr -d ' ')" "0" "no containers left"
+
+section "rmi removes an unused image"
+"$LGCR" pull hello-world > /dev/null 2>&1
+OUT=$("$LGCR" rmi hello-world 2>&1)
+expect_contains "$OUT" "removed hello-world" "rmi reports success"
+OUT=$("$LGCR" images -q 2>&1 || true)
+expect_not_contains "$OUT" "hello-world" "image gone from listing"
 
 # ---------------------------------------------------------------------------
 # cleanup

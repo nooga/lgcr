@@ -54,7 +54,9 @@ lgcr logs -f "$cid"
 | Command | Description |
 |---|---|
 | `lgcr pull <image>` | Fetch an OCI image (Docker Hub or any v2 registry) |
-| `lgcr run [-d\|-it] [--rm] [-e K=V] <image\|rootfs> [cmd [args...]]` | Run a container; `-d` detach, `-it` interactive pty |
+| `lgcr images [-q]` | List pulled images (name, size, age); `-q` just refs |
+| `lgcr rmi [-f] <image>...` | Remove an image; refuses if a container uses it unless `-f` |
+| `lgcr run [-d\|-it] [--rm] [-e K=V] <image\|rootfs> [cmd [args...]]` | Run a container; auto-pulls if the image is missing; `-d` detach, `-it` interactive pty |
 | `lgcr exec [-it] [-e K=V] <id> <cmd> [args...]` | Run a command inside a running container; `-it` for a pty |
 | `lgcr ps [-a] [-q]` | List containers; `-a` includes exited, `-q` just ids |
 | `lgcr logs [-f] <id>` | Dump or tail captured stdout/stderr |
@@ -131,8 +133,9 @@ See [ROADMAP.md](./ROADMAP.md) for the plan. Short version:
 - No capability drop, seccomp, `no_new_privs` — unprivileged workloads only (M4)
 - No rootless user namespaces (M4)
 - No image build (M7 — a Lisp-macro DSL called `defcontainer` is planned)
-- No content-addressable image store — rootfs lands in `/tmp/letgo-rootfs/`
-  for now (M8)
+- No content-addressable image store — each image ref gets its own flat
+  rootfs under `$XDG_DATA_HOME/lgcr/images/` (temporary; M8 replaces this
+  with a proper layer-sharing CAS)
 
 ## Testing
 

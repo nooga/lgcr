@@ -50,6 +50,19 @@
 (defn container-dir [id]
   (str (state-root) "/containers/" id))
 
+;; TEMPORARY image store — flat per-ref rootfs dirs under $XDG_DATA_HOME/lgcr.
+;; Replaced by a content-addressable layer store in M8.
+(defn image-root []
+  (let [xdg  (os/getenv "XDG_DATA_HOME")
+        home (os/getenv "HOME")
+        base (if (and xdg (not= xdg ""))
+               xdg
+               (str home "/.local/share"))]
+    (str base "/lgcr/images")))
+
+(defn image-dir [parsed-ref]
+  (lib/image-rootfs-dir (image-root) parsed-ref))
+
 (defn gen-id []
   ;; 32 hex nibbles from rand-int. Not cryptographic, but fine for uniqueness.
   (loop [n 32 acc ""]
@@ -680,12 +693,12 @@
 (defn resolve-run-target
   "Resolve first positional of `run` to {:rootfs ..., :config ...}.
    Absolute existing dir → bare rootfs (no config).
-   Otherwise → treated as image ref, looked up in /tmp/letgo-rootfs."
+   Otherwise → treated as image ref, looked up in the image store."
   [target]
   (if (and (string/starts-with? target "/") (exists? target))
     {:rootfs target :config nil}
     (let [ref (lib/parse-image-ref target)
-          dir (lib/image-rootfs-dir ref)]
+          dir (image-dir ref)]
       (when-not (exists? dir)
         (do-pull target)
         (when-not (exists? dir)
@@ -1099,8 +1112,9 @@
                  manifests)))
 
 (defn do-pull [image-ref]
-  (let [{:keys [registry repo tag]} (lib/parse-image-ref image-ref)
-        rootfs-dir (str "/tmp/letgo-rootfs/" (string/replace repo "/" "_") "-" tag)
+  (let [parsed     (lib/parse-image-ref image-ref)
+        {:keys [registry repo tag]} parsed
+        rootfs-dir (image-dir parsed)
         ;; detect arch from our own binary
         our-arch (let [uname (:out (os/sh "uname" "-m"))]
                    (cond
@@ -1181,12 +1195,156 @@
                            :cmd        (or (:Cmd inner) [])
                            :entrypoint (or (:Entrypoint inner) [])
                            :workdir    (or (:WorkingDir inner) "")
-                           :user       (or (:User inner) "")}]
+                           :user       (or (:User inner) "")
+                           :ref        (str (:repo parsed) ":" (:tag parsed))
+                           :registry   (:registry parsed)
+                           :pulled-epoch (now-epoch)}]
               (spit (str rootfs-dir "/.lgcr-config.json")
                     (json/write-json reduced))))
 
           (println (str "[pull] rootfs ready at " rootfs-dir))
           rootfs-dir)))))
+
+;; ---------------------------------------------------------------------------
+;; images — list / remove
+;;
+;; TEMPORARY: flat per-ref rootfs dirs under `(image-root)`. Each has a
+;; `.lgcr-config.json` with :ref / :pulled-epoch metadata written by pull.
+;; Replaced by the CAS store in M8.
+;; ---------------------------------------------------------------------------
+
+(defn- dir-size-bytes
+  "Total bytes under `dir` via `du -sb`. Returns nil if du isn't available."
+  [dir]
+  (let [r (os/sh "du" "-sb" dir)]
+    (when (= 0 (:exit r))
+      (try (parse-int (first (string/split (string/trim (:out r)) "\t")))
+           (catch e nil)))))
+
+(defn- list-image-entries
+  "Scan the image store. Returns a seq of {:dir :ref :pulled-epoch :size}."
+  []
+  (let [root (image-root)]
+    (if (exists? root)
+      (let [ls (os/sh "ls" "-1" root)]
+        (if (= 0 (:exit ls))
+          (reduce
+           (fn [acc name]
+             (if (= "" name)
+               acc
+               (let [dir  (str root "/" name)
+                     cfg  (let [p (str dir "/.lgcr-config.json")]
+                            (when (exists? p)
+                              (try (json/read-json (slurp p) {:keywords? true})
+                                   (catch e nil))))]
+                 (conj acc {:dir          dir
+                            :subdir       name
+                            :ref          (or (:ref cfg) name)
+                            :pulled-epoch (:pulled-epoch cfg)
+                            :size         (dir-size-bytes dir)}))))
+           []
+           (string/split (:out ls) "\n"))
+          []))
+      [])))
+
+(defn- containers-using-image
+  "Return a seq of container ids whose :rootfs-src matches the given image dir."
+  [image-dir]
+  (reduce (fn [acc id]
+            (let [st (try (read-state id) (catch e nil))]
+              (if (and st (= image-dir (:rootfs-src st)))
+                (conj acc id)
+                acc)))
+          []
+          (list-container-ids)))
+
+(defn do-images [opts]
+  (let [quiet? (:quiet? opts)
+        rows   (list-image-entries)
+        now-e  (now-epoch)]
+    (cond
+      quiet?
+      (doseq [e rows] (println (:ref e)))
+
+      (empty? rows)
+      nil
+
+      :else
+      (do
+        (println (str (lib/pad-right "IMAGE" 40)
+                      (lib/pad-right "SIZE" 12)
+                      "PULLED"))
+        (doseq [e rows]
+          (let [age (when (:pulled-epoch e)
+                      (str (lib/humanize-ago (- now-e (:pulled-epoch e))) " ago"))]
+            (println (str (lib/pad-right (:ref e) 40)
+                          (lib/pad-right (lib/humanize-bytes (:size e)) 12)
+                          (or age "-")))))))))
+
+(defn- stopped-container-ids []
+  (reduce (fn [acc id]
+            (let [st (try (read-state id) (catch e nil))]
+              (if (and st (not= "running" (effective-status st)))
+                (conj acc id)
+                acc)))
+          []
+          (list-container-ids)))
+
+(defn- container-disk-bytes
+  "Approximate disk footprint of a container's state dir. Best-effort —
+   returns 0 on error. The overlay/run-dir is normally cleaned up by the
+   shim on exit, so we don't try to account for it here."
+  [id]
+  (or (dir-size-bytes (container-dir id)) 0))
+
+(defn do-prune
+  "Remove stopped containers and/or unused images. With no flags, both.
+   An image is 'unused' when no container's :rootfs-src matches its dir."
+  [opts]
+  (let [containers? (or (:containers? opts) (not (or (:containers? opts)
+                                                     (:images? opts))))
+        images?     (or (:images? opts)     (not (or (:containers? opts)
+                                                     (:images? opts))))
+        c-result    (when containers?
+                      (let [ids   (stopped-container-ids)
+                            bytes (reduce (fn [a id] (+ a (container-disk-bytes id)))
+                                          0 ids)]
+                        (doseq [id ids] (do-rm id false))
+                        {:n (count ids) :bytes bytes}))
+        i-result    (when images?
+                      ;; Re-scan users *after* container prune so freshly
+                      ;; orphaned images become eligible.
+                      (let [entries (list-image-entries)
+                            unused  (filter (fn [e]
+                                              (empty? (containers-using-image (:dir e))))
+                                            entries)
+                            bytes   (reduce (fn [a e] (+ a (or (:size e) 0)))
+                                            0 unused)]
+                        (doseq [e unused]
+                          (syscall/rm-rf (:dir e))
+                          (println (str "removed image " (:ref e)
+                                        " (" (lib/humanize-bytes (or (:size e) 0)) ")")))
+                        {:n (count unused) :bytes bytes}))
+        c-n         (get c-result :n 0)
+        c-b         (get c-result :bytes 0)
+        i-n         (get i-result :n 0)
+        i-b         (get i-result :bytes 0)]
+    (println (str "pruned " c-n " container(s), " i-n " image(s); "
+                  "reclaimed " (lib/humanize-bytes (+ c-b i-b))))))
+
+(defn do-rmi [target force?]
+  (let [parsed (lib/parse-image-ref target)
+        dir    (image-dir parsed)]
+    (when-not (exists? dir)
+      (die "no such image: " target))
+    (let [users (containers-using-image dir)]
+      (when (and (seq users) (not force?))
+        (die "image " target " is used by " (count users) " container(s): "
+             (string/join ", " (reduce (fn [a i] (conj a (lib/short-id i))) [] users))
+             " (use -f to remove anyway)")))
+    (let [size (or (dir-size-bytes dir) 0)]
+      (syscall/rm-rf dir)
+      (println (str "removed " target " (" (lib/humanize-bytes size) ")")))))
 
 ;; ---------------------------------------------------------------------------
 ;; main
@@ -1321,6 +1479,34 @@
       (die "usage: container.lg pull <rootfs-url>")
       (do-pull (first tail)))
 
+    (= subcmd "images")
+    (let [flags (loop [f {} xs (split-short-flags tail)]
+                  (cond
+                    (empty? xs) f
+                    (= "-q" (first xs)) (recur (assoc f :quiet? true) (rest xs))
+                    :else f))]
+      (do-images flags))
+
+    (= subcmd "rmi")
+    (let [[flags rest-args]
+          (loop [f {} xs (split-short-flags tail)]
+            (cond
+              (empty? xs) [f xs]
+              (= "-f" (first xs)) (recur (assoc f :force? true) (rest xs))
+              :else [f xs]))]
+      (if (< (count rest-args) 1)
+        (die "usage: lgcr rmi [-f] <image>...")
+        (doseq [t rest-args] (do-rmi t (:force? flags)))))
+
+    (= subcmd "prune")
+    (let [flags (loop [f {} xs tail]
+                  (cond
+                    (empty? xs) f
+                    (= "--containers" (first xs)) (recur (assoc f :containers? true) (rest xs))
+                    (= "--images"     (first xs)) (recur (assoc f :images? true)     (rest xs))
+                    :else (die "usage: lgcr prune [--containers] [--images]")))]
+      (do-prune flags))
+
     :else
     (do
       (println "let-go container runtime")
@@ -1335,8 +1521,11 @@
       (println "  lgcr start <id>...")
       (println "  lgcr inspect <id>")
       (println "  lgcr pull <image>            (e.g. alpine:3.21)")
+      (println "  lgcr images [-q]")
+      (println "  lgcr rmi [-f] <image>...")
+      (println "  lgcr prune [--containers] [--images]")
       (println)
       (println "examples:")
       (println "  lgcr pull alpine:3.21")
-      (println "  lgcr run /tmp/letgo-rootfs/library_alpine-3.21 /bin/sh")
-      (println "  lgcr run -d --rm /tmp/letgo-rootfs/library_alpine-3.21 sleep 60"))))
+      (println "  lgcr run alpine:3.21 /bin/sh")
+      (println "  lgcr run -d --rm alpine:3.21 sleep 60"))))
