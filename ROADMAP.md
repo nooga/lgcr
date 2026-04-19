@@ -17,19 +17,31 @@ Essentially: you can `pull` an image and `run` one foreground command. That's it
 The single biggest jump. Today `run` blocks the terminal and there's no way to
 list, stop, or reattach. After M1, lgcr feels like a runtime instead of a demo.
 
-- Persistent state dir, e.g. `/var/lib/lgcr/containers/<id>/state.json` with
-  id, pid, rootfs, cgroup path, status, log path, command, created-at
-- `run -d` detached: wire child stdout/stderr through `syscall/pipe` to a log
-  file (tee pattern via `async/go*` + `io/copy`); parent returns immediately
-- `logs [-f]`: read / tail the log file
-- `ps`: list state dirs; derive running-state from pid liveness
-- `stop <id>`: `syscall/kill` SIGTERM, grace, then SIGKILL
-- `rm <id>`: teardown overlay + cgroup + state dir
-- **Init-as-PID-1 zombie reaping** inside the container (`waitpid(-1, WNOHANG)`
-  loop) + SIGTERM forwarding to the app. Without this, multi-process containers
-  leak zombies.
-- let-go side: extend `WaitResult` with `:signal` so we can distinguish clean
-  exit from signal-killed.
+**M1.1 — done** (commits `5b2061b` lgcr / `3054876` let-go):
+- XDG-rooted state dir (`$XDG_STATE_HOME/lgcr/containers/<id>/`)
+- `run -d [--rm]` with per-container shim (no daemon)
+- `logs [-f] <id-prefix>` with min-2-char prefix match + ambiguity error
+- state.json with full lifecycle: created → running → exited/killed
+- let-go: `syscall/spawn-async` + `pipe` + `kill` + signal constants,
+  `Setsid` on spawned children so they survive parent session teardown
+
+**M1.2 — next slice**:
+- `ps [-a] [-q]`: list state dirs; running-state derived from pid liveness
+  (`kill -0`). Reuse `resolve-id` prefix lookup.
+- `stop [-t SECS] <id>`: `syscall/kill` SIGTERM, grace, SIGKILL
+- `kill [-s SIG] <id>`: direct signal delivery
+- `rm [-f] <id>`: teardown overlay + cgroup + state dir; `-f` implies stop
+- `inspect <id>`: dump state.json pretty-printed
+- `start <id>`: re-run a stopped one (shim respawn)
+- Name suggestion parity: when printing, always show short (12-char) id
+
+**M1.3 — init-as-PID-1 correctness** (needs the elegant signal story):
+- let-go: `syscall/signal-notify` delivering signals onto an `async/chan`
+- Container `init` spawns the user command, then two go-blocks:
+  - reaper: `waitpid(-1, WNOHANG)` loop to reap orphans/zombies
+  - forwarder: receives SIGTERM/INT/QUIT from signal-chan, forwards to user PID
+- Extend `WaitResult` with `:signal` so we can record the exact signal that
+  killed a container (currently `status -1` collapses all signal deaths)
 
 ## M2 — OCI image config
 

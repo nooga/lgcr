@@ -104,6 +104,46 @@
     (write-state s')
     s'))
 
+(defn pid-alive? [pid]
+  ;; signal 0 = existence probe; ESRCH throws, caught as false
+  (when pid
+    (try
+      (syscall/kill pid 0)
+      true
+      (catch e false))))
+
+(defn effective-status
+  "Returns the real status, correcting stale 'running' entries whose pid is
+   gone (e.g. the shim itself was killed)."
+  [state]
+  (let [s (:status state)]
+    (if (and (= s "running") (not (pid-alive? (:pid state))))
+      "dead"
+      s)))
+
+(def SIGNAL-MAP
+  {"HUP"     syscall/SIGHUP
+   "INT"     syscall/SIGINT
+   "QUIT"    syscall/SIGQUIT
+   "KILL"    syscall/SIGKILL
+   "TERM"    syscall/SIGTERM
+   "CHLD"    syscall/SIGCHLD
+   "WINCH"   syscall/SIGWINCH
+   "SIGHUP"  syscall/SIGHUP
+   "SIGINT"  syscall/SIGINT
+   "SIGQUIT" syscall/SIGQUIT
+   "SIGKILL" syscall/SIGKILL
+   "SIGTERM" syscall/SIGTERM
+   "SIGCHLD" syscall/SIGCHLD
+   "SIGWINCH" syscall/SIGWINCH})
+
+(defn parse-signal [s]
+  (cond
+    (nil? s)          syscall/SIGTERM
+    (get SIGNAL-MAP s) (get SIGNAL-MAP s)
+    :else (let [n (try (parse-int s) (catch e nil))]
+            (or n (die "unknown signal: " s)))))
+
 ;; ---------------------------------------------------------------------------
 ;; rootfs setup
 ;; ---------------------------------------------------------------------------
@@ -419,6 +459,150 @@
             :else nil)))
       (close! h))))
 
+;; ---------------------------------------------------------------------------
+;; ps — list containers
+;; ---------------------------------------------------------------------------
+
+(defn pad-right [s n]
+  (let [extra (- n (count s))]
+    (if (pos? extra) (str s (apply str (repeat extra " "))) s)))
+
+(defn format-cmd [state]
+  (let [c (:command state)
+        a (:args state)]
+    (if (seq a)
+      (str c " " (string/join " " a))
+      (str c))))
+
+(defn do-ps [opts]
+  (let [all?   (:all? opts)
+        quiet? (:quiet? opts)
+        ids    (list-container-ids)
+        rows   (->> ids
+                    (map (fn [id]
+                           (try
+                             (let [st (read-state id)]
+                               (assoc st :effective-status (effective-status st)))
+                             (catch e nil))))
+                    (filter identity)
+                    (filter (fn [s] (or all?
+                                        (= "running" (:effective-status s))))))]
+    (cond
+      quiet?
+      (doseq [s rows]
+        (println (short-id (:id s))))
+
+      (empty? rows)
+      nil  ;; docker prints just the header; we stay silent to keep grep-able
+
+      :else
+      (do
+        (println (str (pad-right "ID" 14)
+                      (pad-right "STATUS" 10)
+                      (pad-right "CREATED" 22)
+                      "COMMAND"))
+        (doseq [s rows]
+          (println (str (pad-right (short-id (:id s)) 14)
+                        (pad-right (:effective-status s) 10)
+                        (pad-right (str (:created s)) 22)
+                        (format-cmd s))))))))
+
+;; ---------------------------------------------------------------------------
+;; stop / kill — signal delivery
+;; ---------------------------------------------------------------------------
+
+(defn do-kill [id-prefix sig]
+  (let [id (or (resolve-id id-prefix) (die "no such container: " id-prefix))
+        st (read-state id)]
+    (when-not (= "running" (effective-status st))
+      (die "container " (short-id id) " is not running"))
+    (syscall/kill (:pid st) sig)
+    (println (short-id id))))
+
+(defn do-stop [id-prefix grace-secs]
+  (let [id (or (resolve-id id-prefix) (die "no such container: " id-prefix))
+        st (read-state id)]
+    (cond
+      (not= "running" (effective-status st))
+      (do (println (short-id id)) nil)  ;; idempotent
+
+      :else
+      (let [pid (:pid st)]
+        (syscall/kill pid syscall/SIGTERM)
+        ;; poll for up to grace-secs * 10 (100ms each)
+        (loop [remaining (* 10 grace-secs)]
+          (cond
+            (not (pid-alive? pid)) nil
+            (<= remaining 0)       (do (syscall/kill pid syscall/SIGKILL)
+                                       (sleep 200))
+            :else                  (do (sleep 100) (recur (- remaining 1)))))
+        (println (short-id id))))))
+
+;; ---------------------------------------------------------------------------
+;; rm — remove a stopped container
+;; ---------------------------------------------------------------------------
+
+(defn do-rm [id-prefix force?]
+  (let [id (or (resolve-id id-prefix) (die "no such container: " id-prefix))
+        st (read-state id)
+        status (effective-status st)]
+    (cond
+      (and (= status "running") (not force?))
+      (die "container " (short-id id)
+           " is running — use -f to force, or stop it first")
+
+      (= status "running")
+      (do (syscall/kill (:pid st) syscall/SIGKILL)
+          (sleep 200)))
+    ;; cleanup leftover overlay / cgroup just in case the shim didn't finish
+    (when-let [merged (:rootfs-merged st)]
+      (try (syscall/umount merged 0) (catch e nil)))
+    (when-let [run-dir (:run-dir st)]
+      (try (sh! "rm" "-rf" run-dir) (catch e nil)))
+    (when-let [cg (:cgroup st)]
+      (try (sh! "rmdir" cg) (catch e nil)))
+    (sh! "rm" "-rf" (container-dir id))
+    (println (short-id id))))
+
+;; ---------------------------------------------------------------------------
+;; inspect — dump state.json
+;; ---------------------------------------------------------------------------
+
+(defn do-inspect [id-prefix]
+  (let [id (or (resolve-id id-prefix) (die "no such container: " id-prefix))]
+    ;; slurp raw so we don't re-encode; add trailing newline if missing
+    (let [raw (slurp (state-path id))]
+      (print raw)
+      (when (not= "\n" (subs raw (max 0 (- (count raw) 1))))
+        (println)))))
+
+;; ---------------------------------------------------------------------------
+;; start — re-spawn a stopped container
+;; ---------------------------------------------------------------------------
+
+(defn do-start [id-prefix]
+  (let [id (or (resolve-id id-prefix) (die "no such container: " id-prefix))
+        st (read-state id)
+        status (effective-status st)]
+    (when (= status "running")
+      (die "container " (short-id id) " is already running"))
+    ;; reset runtime fields; keep command/args/limits/created
+    (update-state id
+                  (fn [s]
+                    (assoc s
+                           :status "created"
+                           :pid nil
+                           :exit-code nil
+                           :signal nil
+                           :started nil
+                           :finished nil)))
+    ;; spawn a fresh shim
+    (let [argv (into (self-prefix) ["shim" id])
+          shim-err (open (str (container-dir id) "/shim.log") :write)
+          _ (syscall/spawn-async (first argv) argv (child-env) 0 nil nil shim-err)]
+      (close! shim-err)
+      (println (short-id id)))))
+
 (defn do-logs [id-prefix follow?]
   (let [id (or (resolve-id id-prefix)
                (die "no such container: " id-prefix))
@@ -605,6 +789,61 @@
         (die "usage: lgcr logs [-f] <id>")
         (do-logs (first rest-args) (:follow? flags))))
 
+    (= subcmd "ps")
+    (let [flags (loop [f {} xs tail]
+                  (cond
+                    (empty? xs) f
+                    (= "-a" (first xs)) (recur (assoc f :all? true) (rest xs))
+                    (= "-q" (first xs)) (recur (assoc f :quiet? true) (rest xs))
+                    :else f))]
+      (do-ps flags))
+
+    (= subcmd "stop")
+    (let [[flags rest-args]
+          (loop [f {} xs tail]
+            (cond
+              (empty? xs) [f xs]
+              (= "-t" (first xs)) (recur (assoc f :grace (parse-int (second xs)))
+                                         (drop 2 xs))
+              :else [f xs]))]
+      (if (< (count rest-args) 1)
+        (die "usage: lgcr stop [-t SECS] <id>...")
+        (doseq [id rest-args]
+          (do-stop id (or (:grace flags) 10)))))
+
+    (= subcmd "kill")
+    (let [[flags rest-args]
+          (loop [f {} xs tail]
+            (cond
+              (empty? xs) [f xs]
+              (= "-s" (first xs)) (recur (assoc f :signal (second xs)) (drop 2 xs))
+              :else [f xs]))]
+      (if (< (count rest-args) 1)
+        (die "usage: lgcr kill [-s SIG] <id>...")
+        (let [sig (parse-signal (:signal flags))]
+          (doseq [id rest-args] (do-kill id sig)))))
+
+    (= subcmd "rm")
+    (let [[flags rest-args]
+          (loop [f {} xs tail]
+            (cond
+              (empty? xs) [f xs]
+              (= "-f" (first xs)) (recur (assoc f :force? true) (rest xs))
+              :else [f xs]))]
+      (if (< (count rest-args) 1)
+        (die "usage: lgcr rm [-f] <id>...")
+        (doseq [id rest-args] (do-rm id (:force? flags)))))
+
+    (= subcmd "inspect")
+    (if (< (count tail) 1)
+      (die "usage: lgcr inspect <id>")
+      (do-inspect (first tail)))
+
+    (= subcmd "start")
+    (if (< (count tail) 1)
+      (die "usage: lgcr start <id>...")
+      (doseq [id tail] (do-start id)))
+
     (= subcmd "init")
     (if (< (count tail) 4)
       (die "usage: container.lg init <merged> <put-old> <hostname> <command> [args...]")
@@ -625,7 +864,13 @@
       (println)
       (println "usage:")
       (println "  lgcr run [-d] [--rm] <rootfs-dir> <command> [args...]")
+      (println "  lgcr ps [-a] [-q]")
       (println "  lgcr logs [-f] <id>")
+      (println "  lgcr stop [-t SECS] <id>...")
+      (println "  lgcr kill [-s SIG] <id>...")
+      (println "  lgcr rm [-f] <id>...")
+      (println "  lgcr start <id>...")
+      (println "  lgcr inspect <id>")
       (println "  lgcr pull <image>            (e.g. alpine:3.21)")
       (println)
       (println "examples:")
