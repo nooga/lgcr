@@ -157,12 +157,12 @@ lgcr's init handles both:
       user-pid (:pid res)]
 
   ;; signal forwarder: everything we catch gets relayed to the user proc
-  (async/go* (fn []
-               (loop []
-                 (let [sig (async/<! sig-ch)]
-                   (when sig
-                     (try (syscall/kill user-pid sig) (catch e nil))
-                     (recur))))))
+  (async/go
+    (loop []
+      (let [sig (async/<! sig-ch)]
+        (when sig
+          (try (syscall/kill user-pid sig) (catch e nil))
+          (recur)))))
 
   ;; reap zombies and wait for user-pid to exit
   (loop []

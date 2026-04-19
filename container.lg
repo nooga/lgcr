@@ -304,12 +304,12 @@
           res      (syscall/spawn-async bin argv env 0 *in* *out* *err*)
           user-pid (:pid res)]
 
-      (async/go* (fn []
-                   (loop []
-                     (let [sig (async/<! sig-ch)]
-                       (when sig
-                         (try (syscall/kill user-pid sig) (catch e nil))
-                         (recur))))))
+      (go
+        (loop []
+          (let [sig (async/<! sig-ch)]
+            (when sig
+              (try (syscall/kill user-pid sig) (catch e nil))
+              (recur)))))
 
       (loop []
         (let [wr (syscall/waitpid -1 0)]

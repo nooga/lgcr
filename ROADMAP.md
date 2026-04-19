@@ -50,7 +50,7 @@ list, stop, or reattach. After M1, lgcr feels like a runtime instead of a demo.
 - let-go: `syscall/signal-notify` delivers signals onto an `async/chan`
 - let-go: `WaitResult` gains `:signal`; distinguishes clean exit from signal-death
 - Container `init` is now PID 1 in the namespace: spawns user command as
-  child, `waitpid(-1)` loop reaps orphans, `async/go*` forwarder relays
+  child, `waitpid(-1)` loop reaps orphans, `async/go` forwarder relays
   SIGTERM/INT/QUIT/HUP to the user process
 - Shim propagates `:signal` into state.json; status is `killed` when signal-died
 - Verified: SIGTERM forwarding (trap → clean exit), orphan reaping, SIGKILL
@@ -86,7 +86,7 @@ list, stop, or reattach. After M1, lgcr feels like a runtime instead of a demo.
 - Interactive `run -it` / `exec -it` — needs a pty primitive:
   - `syscall/open-pty` → `[master slave]` IOHandles
   - `syscall/ioctl-winsz` for resize
-  - SIGWINCH forwarding handled lisp-side with `async/go*`
+  - SIGWINCH forwarding handled lisp-side with `async/go`
 - Without exec, debugging a running container means reading logs and guessing.
 
 ## M4 — security & isolation
