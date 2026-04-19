@@ -4,8 +4,10 @@
 ;;   let-go container.lg run <rootfs-dir> <command> [args...]
 ;;   let-go container.lg pull <image>      (e.g. alpine:3.21, ubuntu:24.04)
 ;;
-;; The "run" command re-execs itself in init mode inside new namespaces.
-;; The "init" command is internal — called by run via unshare(1).
+;; The "run" command re-execs itself in init mode inside new namespaces
+;; via syscall/spawn-async with CLONE_NEW{NS,PID,UTS,IPC}. The spawned
+;; child is PID 1 in the new PID namespace.
+;; The "init" command is internal — called by run via the re-exec.
 
 (ns container.runtime
   (:require [syscall]
@@ -32,6 +34,75 @@
 
 (defn exists? [path]
   (not (nil? (os/stat path))))
+
+;; ---------------------------------------------------------------------------
+;; state store (XDG-rooted, per-container dir)
+;; ---------------------------------------------------------------------------
+
+(defn state-root []
+  (let [xdg  (os/getenv "XDG_STATE_HOME")
+        home (os/getenv "HOME")
+        base (if (and xdg (not= xdg ""))
+               xdg
+               (str home "/.local/state"))]
+    (str base "/lgcr")))
+
+(defn container-dir [id]
+  (str (state-root) "/containers/" id))
+
+(def HEX-CHARS "0123456789abcdef")
+
+(defn gen-id []
+  ;; 32 hex nibbles from rand-int. Not cryptographic, but fine for uniqueness.
+  (apply str (map (fn [_] (get HEX-CHARS (rand-int 16))) (range 32))))
+
+(defn short-id [id] (subs id 0 12))
+
+(defn now-iso []
+  ;; os/sh is cheap enough for this low-frequency path
+  (string/trim (:out (os/sh "date" "-u" "+%Y-%m-%dT%H:%M:%SZ"))))
+
+(defn list-container-ids []
+  (let [dir (str (state-root) "/containers")]
+    (if (exists? dir)
+      (let [ls (os/sh "ls" "-1" dir)]
+        (if (= 0 (:exit ls))
+          (->> (string/split (:out ls) "\n")
+               (filter #(not= "" %))
+               vec)
+          []))
+      [])))
+
+(defn resolve-id
+  "Resolve a prefix (>=2 chars) to a full id. Returns id or nil (not found)
+   or throws on ambiguity."
+  [prefix]
+  (when (< (count prefix) 2)
+    (die "id prefix must be at least 2 characters"))
+  (let [all     (list-container-ids)
+        matches (filter #(string/starts-with? % prefix) all)]
+    (cond
+      (= 0 (count matches)) nil
+      (= 1 (count matches)) (first matches)
+      :else (die "ambiguous id prefix '" prefix "' matches "
+                 (count matches) " containers: "
+                 (string/join ", " (map short-id matches))))))
+
+(defn state-path [id] (str (container-dir id) "/state.json"))
+
+(defn read-state [id]
+  (json/read-json (slurp (state-path id)) {:keywords? true}))
+
+(defn write-state [state]
+  (let [id (:id state)]
+    (syscall/mkdir-p (container-dir id) 0755)
+    (spit (state-path id) (json/write-json state))))
+
+(defn update-state [id f & args]
+  (let [s (read-state id)
+        s' (apply f s args)]
+    (write-state s')
+    s'))
 
 ;; ---------------------------------------------------------------------------
 ;; rootfs setup
@@ -154,76 +225,211 @@
 ;; container run (host side)
 ;; ---------------------------------------------------------------------------
 
-(defn gen-id []
-  (subs (str (rand-int 999999999)) 0 8))
+;; self-reexec argv: for bundled = [self], for interpreted = [self script.lg]
+(defn self-prefix []
+  (let [self (first os/args)
+        second-arg (str (second os/args))
+        bundled? (not (string/ends-with? second-arg ".lg"))]
+    (if bundled? [self] [self second-arg])))
+
+(defn child-env
+  "Minimal env to pass to our re-exec'd children. PATH so shell-outs work,
+   HOME/XDG_STATE_HOME so they find the state dir."
+  []
+  (let [home (or (os/getenv "HOME") "/root")
+        xdg  (os/getenv "XDG_STATE_HOME")]
+    (cond-> ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+             (str "HOME=" home)]
+      (and xdg (not= xdg "")) (conj (str "XDG_STATE_HOME=" xdg)))))
+
+(defn cleanup-container [rootfs cg-path]
+  (try
+    (syscall/umount (:merged rootfs) 0)
+    (catch e nil))
+  (try
+    (sh! "rm" "-rf" (:run-dir rootfs))
+    (catch e nil))
+  (when cg-path
+    (try
+      (sh! "rmdir" cg-path)
+      (catch e nil))))
+
+(defn do-run-detached [container-id]
+  ;; Spawn ourselves as a shim, detached. The shim outlives us and owns
+  ;; the container's lifecycle. For debugging, shim stderr goes to a file
+  ;; in the container dir.
+  (let [argv (into (self-prefix) ["shim" container-id])
+        shim-err (open (str (container-dir container-id) "/shim.log") :write)
+        res  (syscall/spawn-async (first argv) argv (child-env) 0 nil nil shim-err)]
+    (close! shim-err)
+    (println container-id)
+    (os/exit 0)))
+
+(defn do-run-foreground [container-id]
+  (let [state   (read-state container-id)
+        rootfs  (setup-rootfs (:rootfs-src state) container-id)
+        cg-path (when (seq (:limits state))
+                  (setup-cgroups container-id (:limits state)))
+        argv    (into (self-prefix)
+                      (into ["init"
+                             (:merged rootfs)
+                             (:put-old rootfs)
+                             (:hostname state)
+                             (:command state)]
+                            (:args state)))
+        cloneflags (bit-or (bit-or syscall/CLONE_NEWNS  syscall/CLONE_NEWPID)
+                           (bit-or syscall/CLONE_NEWUTS syscall/CLONE_NEWIPC))]
+
+    (println (str "[lgcr] id=" (short-id container-id)))
+    (println (str "[lgcr] rootfs=" (:merged rootfs)))
+
+    (update-state container-id assoc
+                  :status "running"
+                  :started (now-iso)
+                  :cgroup cg-path
+                  :rootfs-merged (:merged rootfs)
+                  :run-dir (:run-dir rootfs))
+
+    (let [res  (syscall/spawn-async (first argv) argv (child-env) cloneflags
+                                     *in* *out* *err*)
+          _    (update-state container-id assoc :pid (:pid res))
+          wr   (syscall/waitpid (:pid res) 0)
+          exit (:status wr)]
+
+      (update-state container-id assoc
+                    :status (if (neg? exit) "killed" "exited")
+                    :exit-code exit
+                    :finished (now-iso))
+
+      (println)
+      (println (str "[lgcr] container exited with status " exit))
+
+      (cleanup-container rootfs cg-path)
+      (when (:rm? (read-state container-id))
+        (sh! "rm" "-rf" (container-dir container-id)))
+
+      (os/exit (if (neg? exit) 1 exit)))))
 
 (defn do-run [rootfs-path command args opts]
   (let [container-id (gen-id)
-        hostname     (get opts :hostname (str "lg-" container-id))
+        hostname     (get opts :hostname (str "lg-" (short-id container-id)))
         limits       (select-keys opts [:memory :cpu :pids])
-        self         (first os/args)]
+        detached?    (:detached? opts)]
 
-    (println (str "[let-go container] id=" container-id))
-    (println (str "[let-go container] rootfs=" rootfs-path))
-    (println (str "[let-go container] cmd=" command " " (string/join " " args)))
+    ;; initial state.json (everything the shim needs)
+    (syscall/mkdir-p (container-dir container-id) 0755)
+    (write-state {:id         container-id
+                  :status     "created"
+                  :rootfs-src rootfs-path
+                  :command    command
+                  :args       args
+                  :hostname   hostname
+                  :limits     limits
+                  :detached?  (boolean detached?)
+                  :rm?        (boolean (:rm? opts))
+                  :created    (now-iso)
+                  :pid        nil
+                  :exit-code  nil
+                  :signal     nil
+                  :started    nil
+                  :finished   nil})
 
-    ;; set up overlay rootfs
-    (let [rootfs (setup-rootfs rootfs-path container-id)]
-      (println (str "[let-go container] overlay=" (:merged rootfs)))
-
-      ;; set up cgroups (if any limits)
-      (let [cg-path (when (seq limits)
-                      (let [cg (setup-cgroups container-id limits)]
-                        (println (str "[let-go container] cgroup=" cg))
-                        cg))]
-
-        ;; re-exec ourselves inside new namespaces via unshare(1)
-        ;; unshare --fork --pid gives us a proper PID namespace (child is PID 1)
-        (let [bundled?  (not (string/ends-with? (str (second os/args)) ".lg"))
-              self-args (if bundled?
-                          [self]
-                          [self (second os/args)])
-              init-args (into ["unshare" "--fork" "--pid" "--mount" "--uts" "--ipc"]
-                              (concat self-args
-                                      ["init"
-                                       (:merged rootfs)
-                                       (:put-old rootfs)
-                                       hostname
-                                       command]))
-              init-args (into init-args args)
-              result    (apply os/sh init-args)]
-
-          ;; cleanup
-          (println)
-          (println (str "[let-go container] container exited with code " (:exit result)))
-          (when (not= "" (:out result))
-            (print (:out result)))
-          (when (not= "" (:err result))
-            (binding [*out* *err*]
-              (print (:err result))))
-
-          ;; cleanup overlay
-          (try
-            (syscall/umount (:merged rootfs) 0)
-            (catch e nil))
-          (sh! "rm" "-rf" (:run-dir rootfs))
-
-          ;; cleanup cgroup
-          (when cg-path
-            (try
-              (sh! "rmdir" cg-path)
-              (catch e nil)))
-
-          (println (str "[let-go container] cleaned up"))
-          (os/exit (:exit result)))))))
+    (if detached?
+      (do-run-detached container-id)
+      (do-run-foreground container-id))))
 
 ;; ---------------------------------------------------------------------------
-;; container init (called via unshare re-exec)
+;; container init (called via the cloneflags re-exec)
 ;; ---------------------------------------------------------------------------
 
 (defn do-init [merged put-old hostname command args]
   (container-init {:merged merged :put-old put-old}
                   hostname command args))
+
+;; ---------------------------------------------------------------------------
+;; shim — per-container supervisor (runs detached from the user's shell)
+;; ---------------------------------------------------------------------------
+
+(defn do-shim [container-id]
+  (let [state      (read-state container-id)
+        stdout-log (str (container-dir container-id) "/stdout.log")
+        stderr-log (str (container-dir container-id) "/stderr.log")
+        stdout-h   (open stdout-log :write)
+        stderr-h   (open stderr-log :write)
+        rootfs     (setup-rootfs (:rootfs-src state) container-id)
+        cg-path    (when (seq (:limits state))
+                     (setup-cgroups container-id (:limits state)))
+        argv       (into (self-prefix)
+                         (into ["init"
+                                (:merged rootfs)
+                                (:put-old rootfs)
+                                (:hostname state)
+                                (:command state)]
+                               (:args state)))
+        cloneflags (bit-or (bit-or syscall/CLONE_NEWNS  syscall/CLONE_NEWPID)
+                           (bit-or syscall/CLONE_NEWUTS syscall/CLONE_NEWIPC))]
+
+    (update-state container-id assoc
+                  :status "running"
+                  :started (now-iso)
+                  :cgroup cg-path
+                  :rootfs-merged (:merged rootfs)
+                  :run-dir (:run-dir rootfs))
+
+    (let [res  (syscall/spawn-async (first argv) argv (child-env) cloneflags
+                                    nil stdout-h stderr-h)
+          _    (update-state container-id assoc :pid (:pid res))
+          wr   (syscall/waitpid (:pid res) 0)
+          exit (:status wr)]
+
+      (close! stdout-h)
+      (close! stderr-h)
+
+      (update-state container-id assoc
+                    :status (if (neg? exit) "killed" "exited")
+                    :exit-code exit
+                    :finished (now-iso))
+
+      (cleanup-container rootfs cg-path)
+      (when (:rm? (read-state container-id))
+        (sh! "rm" "-rf" (container-dir container-id))))))
+
+;; ---------------------------------------------------------------------------
+;; logs — print or tail stdout/stderr of a container
+;; ---------------------------------------------------------------------------
+
+(defn stream-file
+  "Print file content to sink. If follow? keep reading as more data arrives,
+   stopping when stop-fn returns true."
+  [path sink follow? stop-fn]
+  (when (exists? path)
+    (let [h (open path :read)]
+      (loop []
+        (let [chunk (read-bytes h 4096)]
+          (cond
+            chunk
+            (do (binding [*out* sink] (print chunk))
+                (recur))
+
+            follow?
+            (when-not (stop-fn)
+              (sleep 200)
+              (recur))
+
+            :else nil)))
+      (close! h))))
+
+(defn do-logs [id-prefix follow?]
+  (let [id (or (resolve-id id-prefix)
+               (die "no such container: " id-prefix))
+        dir (container-dir id)
+        stop-fn (fn [] (not= "running" (:status (read-state id))))]
+    ;; For the minimal version, stream stdout and stderr sequentially: if
+    ;; follow?=true, stdout streams until the container exits, then stderr
+    ;; dumps remaining. This is equivalent to docker logs for non-follow, and
+    ;; "good enough" for follow on most workloads (stderr is usually small).
+    (stream-file (str dir "/stdout.log") *out* follow? stop-fn)
+    (stream-file (str dir "/stderr.log") *err* false (fn [] true))))
 
 ;; ---------------------------------------------------------------------------
 ;; OCI registry pull
@@ -365,38 +571,64 @@
 (let [bundled? (not (string/ends-with? (str (second os/args)) ".lg"))
       args     (drop (if bundled? 1 2) os/args)
       subcmd   (first args)
-      rest     (vec (drop 1 args))]
+      tail     (vec (drop 1 args))]
   (cond
     (= subcmd "run")
-    (if (< (count rest) 2)
-      (die "usage: container.lg run <rootfs-dir> <command> [args...]")
-      (do-run (first rest)
-              (second rest)
-              (vec (drop 2 rest))
-              {}))
+    ;; parse flags: -d (detach), --rm
+    (let [[flags rest-args]
+          (loop [flags {} xs tail]
+            (cond
+              (empty? xs) [flags xs]
+              (= "-d" (first xs))   (recur (assoc flags :detached? true) (rest xs))
+              (= "--rm" (first xs)) (recur (assoc flags :rm? true) (rest xs))
+              :else [flags xs]))]
+      (if (< (count rest-args) 2)
+        (die "usage: lgcr run [-d] [--rm] <rootfs-dir> <command> [args...]")
+        (do-run (first rest-args)
+                (second rest-args)
+                (vec (drop 2 rest-args))
+                flags)))
+
+    (= subcmd "shim")
+    (if (< (count tail) 1)
+      (die "usage: lgcr shim <id>  (internal)")
+      (do-shim (first tail)))
+
+    (= subcmd "logs")
+    (let [[flags rest-args]
+          (loop [flags {} xs tail]
+            (cond
+              (empty? xs) [flags xs]
+              (= "-f" (first xs)) (recur (assoc flags :follow? true) (rest xs))
+              :else [flags xs]))]
+      (if (< (count rest-args) 1)
+        (die "usage: lgcr logs [-f] <id>")
+        (do-logs (first rest-args) (:follow? flags))))
 
     (= subcmd "init")
-    (if (< (count rest) 4)
+    (if (< (count tail) 4)
       (die "usage: container.lg init <merged> <put-old> <hostname> <command> [args...]")
-      (do-init (nth rest 0)
-               (nth rest 1)
-               (nth rest 2)
-               (nth rest 3)
-               (vec (drop 4 rest))))
+      (do-init (nth tail 0)
+               (nth tail 1)
+               (nth tail 2)
+               (nth tail 3)
+               (vec (drop 4 tail))))
 
     (= subcmd "pull")
-    (if (< (count rest) 1)
+    (if (< (count tail) 1)
       (die "usage: container.lg pull <rootfs-url>")
-      (do-pull (first rest)))
+      (do-pull (first tail)))
 
     :else
     (do
       (println "let-go container runtime")
       (println)
       (println "usage:")
-      (println "  container.lg run  <rootfs-dir> <command> [args...]")
-      (println "  container.lg pull <image>            (e.g. alpine:3.21)")
+      (println "  lgcr run [-d] [--rm] <rootfs-dir> <command> [args...]")
+      (println "  lgcr logs [-f] <id>")
+      (println "  lgcr pull <image>            (e.g. alpine:3.21)")
       (println)
       (println "examples:")
-      (println "  container.lg pull alpine:3.21")
-      (println "  container.lg run /tmp/letgo-rootfs/library_alpine-3.21 /bin/sh"))))
+      (println "  lgcr pull alpine:3.21")
+      (println "  lgcr run /tmp/letgo-rootfs/library_alpine-3.21 /bin/sh")
+      (println "  lgcr run -d --rm /tmp/letgo-rootfs/library_alpine-3.21 sleep 60"))))

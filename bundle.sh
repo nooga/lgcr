@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Bundle container.lg into a standalone linux binary using lg -b inside lima.
+# Bundle container.lg into a standalone linux binary using lg -b.
+# Runs entirely on the host (no Lima needed) using lg -bundle-base to
+# cross-bundle for linux/arm64 from macOS.
 #
-# This produces a single static executable that contains:
+# Produces a single static executable containing:
 #   - the let-go VM + stdlib
 #   - the compiled container.lg bytecode
 #
@@ -13,28 +15,23 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUTPUT="${1:-$SCRIPT_DIR/lgcr}"
 
-# We need a linux lg binary to use as the bundle base.
-# Try the GitHub release first, fall back to building from source.
+LETGO_SRC="$SCRIPT_DIR/../let-go"
+LG_HOST="$SCRIPT_DIR/.lg-host"
 LG_LINUX="$SCRIPT_DIR/.lg-linux"
 
-if [ ! -f "$LG_LINUX" ]; then
-    LETGO_SRC="$SCRIPT_DIR/../let-go"
-    if [ -d "$LETGO_SRC" ] && [ -f "$LETGO_SRC/go.mod" ]; then
-        echo "==> Building let-go linux binary from source..."
-        (cd "$LETGO_SRC" && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o "$LG_LINUX" .)
-    else
-        echo "==> Downloading let-go linux binary..."
-        gh release download v1.4.0 --repo nooga/let-go --pattern "let-go_1.4.0_linux_arm64.tar.gz" --output /tmp/lg-linux.tar.gz
-        tar xzf /tmp/lg-linux.tar.gz -C /tmp lg
-        mv /tmp/lg "$LG_LINUX"
-        rm /tmp/lg-linux.tar.gz
-    fi
+if [ ! -d "$LETGO_SRC" ] || [ ! -f "$LETGO_SRC/go.mod" ]; then
+    echo "error: expected let-go checkout at $LETGO_SRC" >&2
+    exit 1
 fi
-echo "    base binary: $LG_LINUX"
 
-# Bundle inside lima (lg -b needs to run on the same platform as the output)
-echo "==> Bundling container.lg into standalone binary..."
-limactl shell letgo "$LG_LINUX" -b "$OUTPUT" "$SCRIPT_DIR/container.lg"
+echo "==> Building host let-go binary..."
+(cd "$LETGO_SRC" && go build -o "$LG_HOST" .)
+
+echo "==> Building linux/arm64 let-go binary..."
+(cd "$LETGO_SRC" && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o "$LG_LINUX" .)
+
+echo "==> Cross-bundling container.lg → $OUTPUT..."
+"$LG_HOST" -b "$OUTPUT" -bundle-base "$LG_LINUX" "$SCRIPT_DIR/container.lg"
 
 chmod +x "$OUTPUT"
 SIZE=$(ls -lh "$OUTPUT" | awk '{print $5}')
