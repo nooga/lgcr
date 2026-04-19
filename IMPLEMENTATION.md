@@ -146,46 +146,28 @@ A process running as PID 1 in a PID namespace has special kernel duties:
   Docker images don't respond to `docker stop` — they exec a process that
   was never designed to be PID 1.
 
-lgcr's init handles both:
+lgcr's init runs four concurrent loops, all backed by real goroutines
+via let-go's `go`:
 
-```clojure
-(let [sig-ch   (async/chan 8)
-      _        (syscall/signal-notify sig-ch
-                                      syscall/SIGTERM syscall/SIGINT
-                                      syscall/SIGQUIT syscall/SIGHUP)
-      res      (syscall/spawn-async bin argv env 0 *in* *out* *err*)
-      user-pid (:pid res)]
+- **signal forwarder** — `signal.Notify` for SIGTERM/INT/QUIT/HUP is wired
+  into an `async/chan`; every delivery is `syscall/kill`'d to the primary
+  user pid so `lgcr stop` behaves.
+- **reaper** — `SIGCHLD` is wired into a separate channel. On each
+  notification, `waitpid(-1, WNOHANG)` is drained until empty; reaped
+  children go to the state-mgr. This catches orphans (the PID 1 duty) as
+  well as exec children.
+- **state-mgr** — a single goroutine owns the pid→waiter map plus a
+  pending-exits buffer, serving two message types: `:register` (a waiter
+  wants the result for pid N) and `:reap` (the reaper produced a result
+  for pid N). The pending buffer resolves the race where a child exits
+  before its waiter registers.
+- **accept loop** — the control socket (see Chapter 7a) accepts
+  connections and dispatches each to a `handle-exec-conn` goroutine.
 
-  ;; signal forwarder: everything we catch gets relayed to the user proc
-  (async/go
-    (loop []
-      (let [sig (async/<! sig-ch)]
-        (when sig
-          (try (syscall/kill user-pid sig) (catch e nil))
-          (recur)))))
-
-  ;; reap zombies and wait for user-pid to exit
-  (loop []
-    (let [wr (syscall/waitpid -1 0)]
-      (if (= (:pid wr) user-pid)
-        (os/exit ...)
-        (recur)))))
-```
-
-Two concurrent loops:
-
-- The **signal forwarder** is a let-go go-block (real Go goroutine) that
-  takes from an `async/chan`. `syscall/signal-notify` wires Go's
-  `signal.Notify` into that chan: every SIGTERM the kernel delivers to
-  init shows up as an int in the channel. The go-block relays it with
-  `syscall/kill`.
-- The main thread blocks on `waitpid(-1, 0)` — "any child, blocking."
-  Every time it returns, we check whether the reaped pid is the user's
-  main process. If yes, we exit with its status (or `128 + signal`); if
-  no, it was an orphan grandchild and we loop back to reap the next one.
-
-This is exactly what tools like [tini](https://github.com/krallin/tini) do,
-and what Docker gives you when you pass `--init`. In lgcr it's just baked in.
+The main init thread is the primary user pid's "waiter": it registers
+with the state-mgr and blocks on its reply channel. When that fires, we
+close the listener, unlink the socket, and exit with the primary's
+status. This is tini's job — in lgcr it's just baked in.
 
 ### The cloneflags dance
 
@@ -273,6 +255,66 @@ fresh every time. If the shim gets killed, the container entry becomes
 in this model become harder if we ever want HA — that's a tradeoff called
 out in the roadmap's M6 section.
 
+## Chapter 6a — Exec and the control socket
+
+The obvious "just call `setns(2)` from `lgcr exec`" approach does not work.
+Go's runtime creates threads with `CLONE_FS`, which means mount-namespace
+`setns` reliably returns `EINVAL` — the kernel refuses to change mnt-ns
+while any thread shares FS state. Runc works around this with a CGO
+constructor (`nsexec.c`) that runs before the Go runtime. We'd like to
+stay CGO-free.
+
+**Solution**: the container's init already lives in every namespace. So
+we let init be the launcher.
+
+Each container gets a Unix socket at `$STATE_DIR/<id>/ctrl.sock`, created
+by init **before** `pivot_root` so the path lives on the host mnt and
+the listener fd outlives the mnt-ns switch. Init's accept loop waits for
+connections; each one is a request to fork a command.
+
+The protocol is stupidly simple — JSON with `SCM_RIGHTS` fds:
+
+```
+→ client: {"argv":["/bin/sh","-c","echo hi"],"env":[...],"tty":false}
+   ancillary: 3 fds (client's stdin/stdout/stderr, or pty slave × 3)
+← init:   {"pid":42}
+← init:   {"exit":0,"signal":0}
+```
+
+The client's stdio fds arrive on init's side as new fds in its table —
+dropped straight into `spawn-async`'s stdio slots. The child inherits
+them via Go's `os.StartProcess` dup, and init's copies are closed. The
+child runs in all of init's namespaces (mnt/pid/uts/ipc) without any
+`setns` call — it's just a normal fork from a process that's already
+where we need to be.
+
+The same substrate is meant to grow into stats subscriptions, lifecycle
+events, and attach (see ROADMAP M6) — same socket, same framing, more
+ops.
+
+### `-it`: pty wiring
+
+For `exec -it`, the client allocates a pty pair on the host:
+
+- `term/open-pty` → `{:master :slave :slave-path "/dev/pts/N"}`
+- Put client's stdin into raw mode (`term/raw-mode! *in*` returns an
+  opaque saved termios — restored on every exit path)
+- Send the *slave* three times as the request's fds; tag the request
+  with `:tty true`
+- Init's handle-exec-conn sees `:tty`, passes `{:setctty? true}` to
+  `spawn-async`. That sets `SysProcAttr.Setctty = true, Ctty = 0` — the
+  kernel makes fd 0 (the pty slave) the child's controlling terminal,
+  which is required for Ctrl-C, job control, and `ioctl(TIOCGWINSZ)`
+  from inside the container.
+
+Three client-side goroutines then shuttle bytes:
+
+- stdin → pty master (raw passthrough; Ctrl-C is just a byte)
+- pty master → stdout (terminates on EOF when the child + init's slave
+  dup are both closed)
+- SIGWINCH handler → `term/set-size master` so `stty size` inside the
+  container always matches the host terminal
+
 ## Chapter 7 — let-go side: the syscall surface
 
 Some of what lgcr does wasn't possible with stock let-go. Along the way
@@ -293,6 +335,21 @@ we added these primitives to let-go's `syscall` namespace:
 - **`WaitResult.signal`** — `waitpid` used to flatten "exit 137" and
   "SIGKILL'd" into a single `:status -1`. Now it reports both, so we can
   tell them apart and record `:signal` in state.json.
+- **`syscall/spawn-async` opts** — an 8th optional map arg. Currently
+  understands `{:setctty? true}`, which sets `SysProcAttr.Setctty` so a
+  pty-slave stdin becomes the child's controlling terminal.
+
+Two new namespaces landed for M3:
+
+- **`unix/`** — AF_UNIX stream sockets with `SCM_RIGHTS` fd passing. Six
+  primitives: `listen`, `accept`, `connect`, `send`, `recv`, `close`,
+  plus `fd` to coerce an IOHandle to a raw int. Generic enough that M6's
+  event stream will reuse them.
+- **`term/`** gained pty-side primitives on top of xsofy's existing
+  raw-mode / size / ANSI helpers: `open-pty`, `set-size` (TIOCSWINSZ),
+  `tty?`, and fd-parameterized variants of `raw-mode!` / `restore-mode!`
+  / `size` so you can drive an arbitrary fd, not just the process's own
+  stdin/stdout.
 
 The `lg` tool itself also grew two features:
 

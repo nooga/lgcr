@@ -79,15 +79,38 @@ list, stop, or reattach. After M1, lgcr feels like a runtime instead of a demo.
 - `init` subcommand refactored: takes `<id>` and reads state.json (cleaner
   than passing 5 positionals)
 
-## M3 — exec & TTY
+## M3 — exec & TTY — done
 
-- `exec <id> <cmd>` via `setns(2)` into the running container's existing
-  namespaces
-- Interactive `run -it` / `exec -it` — needs a pty primitive:
-  - `syscall/open-pty` → `[master slave]` IOHandles
-  - `syscall/ioctl-winsz` for resize
-  - SIGWINCH forwarding handled lisp-side with `async/go`
-- Without exec, debugging a running container means reading logs and guessing.
+`setns(CLONE_NEWNS)` from multithreaded Go reliably returns EINVAL, so the
+obvious "call setns from `lgcr exec`" path doesn't work. Runc solves this
+with a CGO constructor; we stayed CGO-free by routing exec through the
+container's existing init, which is already in every namespace.
+
+**M3.1 — control socket + `exec`**:
+- Init creates `$STATE_DIR/<id>/ctrl.sock` before `pivot_root`; the
+  listener fd outlives the mnt-ns switch. Client connects from the host,
+  sends a JSON request + stdio fds via `SCM_RIGHTS`. Init forks a child
+  that inherits all namespaces for free.
+- New `unix` namespace in let-go: `listen`, `accept`, `connect`, `send`,
+  `recv`, `close`, `fd`. Generic fd-passing substrate (also what M6's
+  event stream will ride on).
+- Init's single `waitpid(-1)` loop became a state-mgr + SIGCHLD-driven
+  reaper. One goroutine owns the pid→waiter map plus a pending-exits
+  buffer so spawn-then-reap races can't drop an exit status.
+
+**M3.2 — pty + `-it`**:
+- `term` namespace gained `open-pty` (ptmx + TIOCGPTN), `set-size`
+  (TIOCSWINSZ), `tty?`, and fd-parameterized `raw-mode!` / `restore-mode!`
+  / `size`.
+- `syscall/spawn-async` grew an optional options map; `{:setctty? true}`
+  makes fd 0 in the child (the pty slave) the controlling terminal so
+  Ctrl-C, job control, and TIOCGWINSZ work inside the container.
+- `lgcr exec -it` allocates the pty on the host, sends the slave three
+  times as stdin/stdout/stderr, and runs three goroutines: stdin→master,
+  master→stdout, SIGWINCH→`term/set-size`. Client stdin is put in raw
+  mode with the saved termios restored on all exit paths.
+
+Not yet: `run -it` (for now, `run -d` + `exec -it`) and `exec --user`.
 
 ## M4 — security & isolation
 

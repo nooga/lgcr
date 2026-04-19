@@ -11,6 +11,8 @@
 
 (ns container.runtime
   (:require [syscall]
+            [unix]
+            [term]
             [string]
             [io]
             [lib]))
@@ -248,6 +250,44 @@
     (exists? (str "/usr/sbin/" cmd))  (str "/usr/sbin/" cmd)
     :else (die "command not found: " cmd)))
 
+(defn handle-exec-conn
+  "Runs inside init. Reads one exec request off conn, forks the requested
+   command with the passed-in stdio fds, and streams {pid} / {exit, signal}
+   responses back over the same conn. Races around spawn→reap are handled
+   by the state-mgr via the register/reap protocol on state-ch."
+  [conn state-ch]
+  (try
+    (let [msg      (unix/recv conn 32768 3)
+          req      (json/read-json (:data msg) {:keywords? true})
+          fds      (:fds msg)
+          stdin    (nth fds 0 nil)
+          stdout   (nth fds 1 nil)
+          stderr   (nth fds 2 nil)
+          argv     (vec (:argv req))
+          env      (vec (or (:env req) []))
+          tty?     (:tty req)
+          bin      (resolve-bin (first argv))
+          ;; :setctty? on tty? makes the pty slave (fd 0 in child) the controlling
+          ;; terminal so ioctl / Ctrl-C / job control all work.
+          opts     (if tty? {:setctty? true} nil)
+          res      (syscall/spawn-async bin argv env 0 stdin stdout stderr opts)
+          pid      (:pid res)
+          wait-ch  (async/chan 1)]
+      ;; Parent closes its dup'd copies; the child has its own fds now.
+      (when stdin  (try (unix/close stdin)  (catch e nil)))
+      (when stdout (try (unix/close stdout) (catch e nil)))
+      (when stderr (try (unix/close stderr) (catch e nil)))
+      ;; Register before the child can possibly be reaped and forgotten.
+      ;; state-mgr handles the race where SIGCHLD lands first.
+      (async/>! state-ch {:op :register :pid pid :ch wait-ch})
+      (unix/send conn (json/write-json {:pid pid}))
+      (let [wr (async/<! wait-ch)]
+        (unix/send conn (json/write-json {:exit   (or (:status wr) 0)
+                                          :signal (or (:signal wr) 0)}))))
+    (catch e
+      (try (unix/send conn (json/write-json {:error (str e)})) (catch e2 nil))))
+  (try (unix/close conn) (catch e nil)))
+
 (defn container-init
   "Called inside the new namespaces. Sets up the mount tree, becomes PID 1,
    spawns the user command, forwards signals, reaps orphans.
@@ -260,7 +300,12 @@
         args     (:args state)
         workdir  (:workdir state)
         img-env  (or (:env-image state) [])
-        user-env (or (:env state) [])]
+        user-env (or (:env state) [])
+        sock-path (str (container-dir (:id state)) "/ctrl.sock")
+        ;; Control socket — created BEFORE pivot_root so the socket file lives
+        ;; on the host mnt, visible to lgcr exec clients. The listener fd
+        ;; survives the mnt-ns switch; accept() works post-pivot.
+        listener  (unix/listen sock-path)]
 
     ;; make our mount tree private so changes don't propagate to host
     (syscall/mount "none" "/" "none" (bit-or syscall/MS_REC syscall/MS_PRIVATE) "")
@@ -297,13 +342,45 @@
                                 (str "HOSTNAME=" hostname)
                                 "HOME=/root"
                                 "TERM=xterm"))
+          ;; state-ch routes register/reap events to the state-mgr goroutine.
+          ;; state-mgr owns the pid→waiter map + pending-exits buffer; this
+          ;; pattern avoids the classic race between a fork returning a pid
+          ;; and the reaper consuming SIGCHLD before the waiter registers.
+          state-ch (async/chan 32)
           sig-ch   (async/chan 8)
-          _        (syscall/signal-notify sig-ch
-                                          syscall/SIGTERM syscall/SIGINT
-                                          syscall/SIGQUIT syscall/SIGHUP)
+          chld-ch  (async/chan 16)
+          primary-ch (async/chan 1)
+          ;; Register for SIGCHLD BEFORE spawning — else a fast-exiting primary
+          ;; delivers its signal to a disposition we haven't subscribed to yet.
+          _        (syscall/signal-notify chld-ch syscall/SIGCHLD)
           res      (syscall/spawn-async bin argv env 0 *in* *out* *err*)
           user-pid (:pid res)]
 
+      ;; state-mgr — serializes all waiter bookkeeping.
+      (go
+        (loop [waiters {} pending {}]
+          (let [msg (async/<! state-ch)]
+            (cond
+              (= (:op msg) :register)
+              (let [pid (:pid msg) ch (:ch msg)]
+                (if-let [wr (get pending pid)]
+                  (do (async/>! ch wr)
+                      (recur waiters (dissoc pending pid)))
+                  (recur (assoc waiters pid ch) pending)))
+
+              (= (:op msg) :reap)
+              (let [pid (:pid msg) wr (:wr msg)]
+                (if-let [ch (get waiters pid)]
+                  (do (async/>! ch wr)
+                      (recur (dissoc waiters pid) pending))
+                  (recur waiters (assoc pending pid wr))))
+
+              :else (recur waiters pending)))))
+
+      ;; signal forwarder — relay terminating signals to the primary user pid.
+      (syscall/signal-notify sig-ch
+                             syscall/SIGTERM syscall/SIGINT
+                             syscall/SIGQUIT syscall/SIGHUP)
       (go
         (loop []
           (let [sig (async/<! sig-ch)]
@@ -311,15 +388,40 @@
               (try (syscall/kill user-pid sig) (catch e nil))
               (recur)))))
 
-      (loop []
-        (let [wr (syscall/waitpid -1 0)]
-          (if (= (:pid wr) user-pid)
-            (let [sg (:signal wr)
-                  st (:status wr)]
-              (os/exit (cond
-                         (> sg 0) (+ 128 sg)
-                         :else    st)))
-            (recur)))))))
+      ;; reaper — drain any pre-existing exits (in case SIGCHLD fired during
+      ;; spawn setup) and then block on SIGCHLD notifications.
+      (go
+        (let [drain (fn []
+                      (loop []
+                        (let [wr (try (syscall/waitpid -1 syscall/WNOHANG)
+                                      (catch e {:pid 0}))]
+                          (when (> (:pid wr) 0)
+                            (async/>! state-ch {:op :reap :pid (:pid wr) :wr wr})
+                            (recur)))))]
+          (drain)
+          (loop []
+            (async/<! chld-ch)
+            (drain)
+            (recur))))
+
+      ;; accept loop — spawn a handler goroutine per incoming connection.
+      (go
+        (loop []
+          (let [conn (try (unix/accept listener) (catch e nil))]
+            (when conn
+              (go (handle-exec-conn conn state-ch))
+              (recur)))))
+
+      ;; Block on the primary user pid. state-mgr routes the eventual reap to us.
+      (async/>! state-ch {:op :register :pid user-pid :ch primary-ch})
+      (let [wr (async/<! primary-ch)
+            sg (:signal wr)
+            st (:status wr)]
+        (try (unix/close listener) (catch e nil))
+        (try (syscall/rm sock-path) (catch e nil))
+        (os/exit (cond
+                   (> sg 0) (+ 128 sg)
+                   :else    st))))))
 
 ;; ---------------------------------------------------------------------------
 ;; container run (host side)
@@ -660,6 +762,111 @@
         (println)))))
 
 ;; ---------------------------------------------------------------------------
+;; exec — run a command inside a running container via the control socket
+;; ---------------------------------------------------------------------------
+
+(defn- exec-wait-reply [conn]
+  (let [msg (unix/recv conn 4096 0)]
+    (json/read-json (:data msg) {:keywords? true})))
+
+(defn- do-exec-tty
+  "Interactive pty-backed exec. Allocates a pty on the client, passes the slave
+   to init as stdio, shuttles bytes between the terminal and the master, and
+   propagates SIGWINCH. Client stdin must be a tty."
+  [conn req]
+  (when-not (term/tty? *in*)
+    (unix/close conn)
+    (die "the input device is not a TTY"))
+  (let [pty        (term/open-pty)
+        master     (:master pty)
+        slave      (:slave pty)
+        ;; Mirror the terminal's current size to the pty before the child starts.
+        initial-sz (term/size)]
+    (when initial-sz
+      (term/set-size master (first initial-sz) (second initial-sz)))
+    (unix/send conn (json/write-json (assoc req :tty true)) [slave slave slave])
+    ;; We don't need the slave anymore — init's handle-exec-conn has its own dup.
+    (unix/close slave)
+    (let [started (exec-wait-reply conn)]
+      (when (:error started)
+        (unix/close master) (unix/close conn)
+        (die "exec failed: " (:error started)))
+      (when-not (:pid started)
+        (unix/close master) (unix/close conn)
+        (die "exec failed: unexpected reply " started)))
+    ;; Raw mode on our terminal so Ctrl-C / arrow keys / line editing all
+    ;; travel as bytes to the child. We must restore this on every exit path.
+    (let [saved (term/raw-mode! *in*)]
+      ;; stdin → master
+      (go
+        (loop []
+          (let [buf (read-bytes *in* 4096)]
+            (when buf
+              (try (write! master buf) (flush! master) (catch e nil))
+              (recur)))))
+      ;; master → stdout — terminates when the pty closes (child + init's slave dup are gone).
+      (let [reader-done (async/chan 1)]
+        (go
+          (loop []
+            (let [buf (try (read-bytes master 4096) (catch e nil))]
+              (if buf
+                (do (try (write! *out* buf) (flush! *out*) (catch e nil))
+                    (recur))
+                (async/>! reader-done true)))))
+        ;; SIGWINCH: resize the pty so the child sees our current size.
+        (let [win-ch (async/chan 4)]
+          (syscall/signal-notify win-ch syscall/SIGWINCH)
+          (go
+            (loop []
+              (when (async/<! win-ch)
+                (let [sz (term/size)]
+                  (when sz
+                    (try (term/set-size master (first sz) (second sz)) (catch e nil))))
+                (recur)))))
+        (let [ex (exec-wait-reply conn)
+              sg (or (:signal ex) 0)
+              st (or (:exit ex) 0)]
+          ;; Let the master reader drain anything the child wrote just before exit.
+          (async/<! reader-done)
+          (try (term/restore-mode! *in* saved) (catch e nil))
+          (try (unix/close master) (catch e nil))
+          (try (unix/close conn) (catch e nil))
+          (os/exit (cond (> sg 0) (+ 128 sg) :else st)))))))
+
+(defn do-exec [id-prefix argv extra-env tty?]
+  (when (< (count argv) 1)
+    (die "usage: lgcr exec [-it] [-e K=V]... <id> <cmd> [args...]"))
+  (let [id     (or (resolve-id id-prefix) (die "no such container: " id-prefix))
+        st     (read-state id)
+        status (effective-status st)]
+    (when (not= status "running")
+      (die "container " (lib/short-id id) " is not running (" status ")"))
+    (let [sock (str (container-dir id) "/ctrl.sock")]
+      (when-not (exists? sock)
+        (die "container " (lib/short-id id) " has no control socket (older container?)"))
+      (let [conn    (try (unix/connect sock) (catch e (die "connect " sock ": " e)))
+            img-env (or (:env-image st) [])
+            ctr-env (or (:env st) [])
+            req-env (vec (lib/merge-env img-env (concat ctr-env (or extra-env []))))
+            req     {:argv (vec argv) :env req-env}]
+        (if tty?
+          (do-exec-tty conn req)
+          (do
+            (unix/send conn (json/write-json req) [*in* *out* *err*])
+            (let [started (exec-wait-reply conn)]
+              (when (:error started)
+                (unix/close conn)
+                (die "exec failed: " (:error started)))
+              (when-not (:pid started)
+                (unix/close conn)
+                (die "exec failed: unexpected reply " started)))
+            (let [ex (exec-wait-reply conn)
+                  sg (or (:signal ex) 0)
+                  st (or (:exit ex) 0)]
+              (unix/close conn)
+              (os/exit (cond (> sg 0) (+ 128 sg) :else st)))))))))
+
+;; ---------------------------------------------------------------------------
 ;; start — re-spawn a stopped container
 ;; ---------------------------------------------------------------------------
 
@@ -922,6 +1129,22 @@
     (if (< (count tail) 1)
       (die "usage: lgcr inspect <id>")
       (do-inspect (first tail)))
+
+    (= subcmd "exec")
+    (let [[flags rest-args]
+          (loop [f {} xs (split-short-flags tail)]
+            (cond
+              (empty? xs) [f xs]
+              (= "-e" (first xs)) (recur (update f :extra-env
+                                                 (fn [e] (conj (or e []) (second xs))))
+                                         (drop 2 xs))
+              (= "-t" (first xs)) (recur (assoc f :tty? true) (rest xs))
+              (= "-i" (first xs)) (recur f (rest xs))   ;; accepted, no-op
+              :else [f xs]))]
+      (if (< (count rest-args) 2)
+        (die "usage: lgcr exec [-it] [-e K=V]... <id> <cmd> [args...]")
+        (do-exec (first rest-args) (vec (drop 1 rest-args))
+                 (:extra-env flags) (:tty? flags))))
 
     (= subcmd "start")
     (if (< (count tail) 1)

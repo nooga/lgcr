@@ -48,6 +48,7 @@ lgcr logs -f "$cid"
 |---|---|
 | `lgcr pull <image>` | Fetch an OCI image (Docker Hub or any v2 registry) |
 | `lgcr run [-d] [--rm] [-e K=V] <image\|rootfs> [cmd [args...]]` | Run a container, foreground or detached |
+| `lgcr exec [-it] [-e K=V] <id> <cmd> [args...]` | Run a command inside a running container; `-it` for a pty |
 | `lgcr ps [-a] [-q]` | List containers; `-a` includes exited, `-q` just ids |
 | `lgcr logs [-f] <id>` | Dump or tail captured stdout/stderr |
 | `lgcr stop [-t SECS] <id>...` | SIGTERM, grace, SIGKILL |
@@ -79,6 +80,13 @@ lgcr ps -a
 
 # Inspect the full lifecycle record
 lgcr inspect a1b2 | jq .
+
+# Drop into a shell inside a running container (pty, job control, resize — all wired)
+cid=$(lgcr run -d alpine:3.21 sleep infinity)
+lgcr exec -it "$cid" sh
+
+# Non-interactive exec: fire a command, get its exit code back
+lgcr exec "$cid" sh -c 'ls /proc | head'
 ```
 
 ## What it does well
@@ -94,6 +102,10 @@ lgcr inspect a1b2 | jq .
 - **Per-container shim, no daemon** — `run -d` spawns a supervisor process
   per container. The CLI itself is stateless; you can kill your shell and
   containers keep running.
+- **Exec + interactive pty** — each container's PID 1 exposes a unix control
+  socket; `exec` sends requests with stdio fds via `SCM_RIGHTS`. `-it`
+  allocates a pty on the host and wires in raw-mode input, output, and
+  `SIGWINCH` resize.
 - **Rootless-friendly state** — state lives in
   `$XDG_STATE_HOME/lgcr/containers/<id>/` so you don't need `/var/lib`
   root-owned directories.
@@ -105,8 +117,7 @@ lgcr inspect a1b2 | jq .
 
 See [ROADMAP.md](./ROADMAP.md) for the plan. Short version:
 
-- No `exec` into a running container (M3)
-- No pty / `-it` (M3)
+- No `run -it` yet — for an interactive session, `run -d` then `exec -it`
 - No networking — containers share the host network for now (M5)
 - No capability drop, seccomp, `no_new_privs` — unprivileged workloads only (M4)
 - No rootless user namespaces (M4)

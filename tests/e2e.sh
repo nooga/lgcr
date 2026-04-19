@@ -177,6 +177,61 @@ section "env override: -e FOO=bar arrives inside container"
 OUT=$("$LGCR" run -e "FOO=bar" "$IMG" sh -c "echo FOO=\$FOO")
 expect_contains "$OUT" "FOO=bar"
 
+section "exec runs a command inside a running container"
+EXID=$("$LGCR" run -d "$IMG" sleep 120 2>&1 | tail -1)
+sleep 0.5
+OUT=$("$LGCR" exec "${EXID:0:6}" echo hello-exec 2>&1)
+expect_contains "$OUT" "hello-exec" "exec stdout captured"
+
+section "exec propagates non-zero exit code"
+set +e
+"$LGCR" exec "${EXID:0:6}" /bin/sh -c "exit 42" > /dev/null 2>&1
+EC=$?
+set -e
+expect_eq "$EC" "42" "exec exit code"
+
+section "exec reports signal as 128+signal"
+set +e
+"$LGCR" exec "${EXID:0:6}" /bin/sh -c 'kill -TERM $$' > /dev/null 2>&1
+EC=$?
+set -e
+expect_eq "$EC" "143" "TERM = 128+15"
+
+section "exec -e sets env inside the container"
+OUT=$("$LGCR" exec -e FOO=exec-me "${EXID:0:6}" env 2>&1)
+expect_contains "$OUT" "FOO=exec-me" "custom env"
+
+section "exec shares mount ns — can see primary's fs effects"
+"$LGCR" exec "${EXID:0:6}" /bin/sh -c "echo marker > /tmp/from-exec" > /dev/null 2>&1
+OUT=$("$LGCR" exec "${EXID:0:6}" cat /tmp/from-exec 2>&1)
+expect_contains "$OUT" "marker" "second exec sees first exec's file"
+
+section "exec -it allocates a pty (stdin is-a-tty, /dev/pts/N)"
+OUT=$(script -qc "$LGCR exec -it ${EXID:0:6} /bin/sh -c \"tty; [ -t 0 ] && echo is-tty || echo not-tty\"" /dev/null 2>&1)
+expect_contains "$OUT" "/dev/pts/" "pty allocated"
+expect_contains "$OUT" "is-tty" "stdin is a tty"
+
+section "exec -it propagates initial winsize"
+OUT=$(script -qc "stty cols 133 rows 42 2>/dev/null; $LGCR exec -it ${EXID:0:6} stty size" /dev/null 2>&1)
+expect_contains "$OUT" "42 133" "stty size inside container"
+
+section "exec -it interactive shell accepts input"
+OUT=$(printf "echo hello-from-pty\nexit\n" | script -qc "$LGCR exec -it ${EXID:0:6} /bin/sh" /dev/null 2>&1)
+expect_contains "$OUT" "hello-from-pty" "command output via stdin"
+
+"$LGCR" rm -f "${EXID:0:6}" > /dev/null
+
+section "exec on a stopped container errors"
+STOPID=$("$LGCR" run -d "$IMG" true 2>&1 | tail -1)
+sleep 0.5
+set +e
+OUT=$("$LGCR" exec "${STOPID:0:6}" echo hi 2>&1)
+EC=$?
+set -e
+expect_eq "$EC" "1" "exec rc=1 on stopped"
+expect_contains "$OUT" "not running" "error mentions not running"
+"$LGCR" rm -f "${STOPID:0:6}" > /dev/null
+
 section "id prefix ambiguity is caught"
 # generate two containers, use 2-char prefix '0...' → potentially ambiguous.
 # do this by running twice with --rm off, leaving state dirs.
