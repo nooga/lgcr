@@ -54,7 +54,9 @@
 
 (defn gen-id []
   ;; 32 hex nibbles from rand-int. Not cryptographic, but fine for uniqueness.
-  (apply str (map (fn [_] (get HEX-CHARS (rand-int 16))) (range 32))))
+  (loop [n 32 acc ""]
+    (if (= 0 n) acc
+        (recur (- n 1) (str acc (get HEX-CHARS (rand-int 16)))))))
 
 (defn short-id [id] (subs id 0 12))
 
@@ -86,7 +88,7 @@
       (= 1 (count matches)) (first matches)
       :else (die "ambiguous id prefix '" prefix "' matches "
                  (count matches) " containers: "
-                 (string/join ", " (map short-id matches))))))
+                 (string/join ", " (reduce (fn [acc x] (conj acc (short-id x))) [] matches))))))
 
 (defn state-path [id] (str (container-dir id) "/state.json"))
 
@@ -243,23 +245,49 @@
     ;; set hostname
     (syscall/sethostname hostname)
 
-    ;; exec the command
+    ;; resolve the binary
     (let [bin (str "/bin/" cmd)
-          ;; try common paths
           bin (cond
                 (exists? bin) bin
                 (exists? (str "/usr/bin/" cmd)) (str "/usr/bin/" cmd)
                 (exists? (str "/sbin/" cmd)) (str "/sbin/" cmd)
                 (exists? (str "/usr/sbin/" cmd)) (str "/usr/sbin/" cmd)
-                ;; if it's an absolute path, use it directly
                 (string/starts-with? cmd "/") cmd
-                :else (die "command not found: " cmd))]
-      (syscall/exec bin
-                    (into [bin] args)
-                    ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-                     (str "HOSTNAME=" hostname)
-                     "HOME=/root"
-                     "TERM=xterm"]))))
+                :else (die "command not found: " cmd))
+          argv (into [bin] args)
+          env  ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                (str "HOSTNAME=" hostname)
+                "HOME=/root"
+                "TERM=xterm"]
+          ;; signal channel — let-go goroutine forwards to user-pid
+          sig-ch (async/chan 8)
+          _ (syscall/signal-notify sig-ch
+                                   syscall/SIGTERM syscall/SIGINT
+                                   syscall/SIGQUIT syscall/SIGHUP)
+          ;; spawn the user command as a child. We stay PID 1 in the ns.
+          res  (syscall/spawn-async bin argv env 0 *in* *out* *err*)
+          user-pid (:pid res)]
+
+      ;; signal forwarder: everything we catch gets relayed to the user proc
+      (async/go* (fn []
+                   (loop []
+                     (let [sig (async/<! sig-ch)]
+                       (when sig
+                         (try (syscall/kill user-pid sig) (catch e nil))
+                         (recur))))))
+
+      ;; reap zombies and wait for user-pid to exit. waitpid(-1) catches any
+      ;; child; we only care about the user's final status, but reaping the
+      ;; rest prevents zombie accumulation for multi-process containers.
+      (loop []
+        (let [wr (syscall/waitpid -1 0)]
+          (if (= (:pid wr) user-pid)
+            (let [sg (:signal wr)
+                  st (:status wr)]
+              (os/exit (cond
+                         (> sg 0) (+ 128 sg)  ;; conventional 128+signal
+                         :else    st)))
+            (recur)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; container run (host side)
@@ -334,12 +362,14 @@
                                      *in* *out* *err*)
           _    (update-state container-id assoc :pid (:pid res))
           wr   (syscall/waitpid (:pid res) 0)
-          exit (:status wr)]
+          exit (:status wr)
+          sg   (:signal wr)]
 
       (update-state container-id assoc
-                    :status (if (neg? exit) "killed" "exited")
+                    :status    (if (pos? sg) "killed" "exited")
                     :exit-code exit
-                    :finished (now-iso))
+                    :signal    (when (pos? sg) sg)
+                    :finished  (now-iso))
 
       (println)
       (println (str "[lgcr] container exited with status " exit))
@@ -420,15 +450,17 @@
                                     nil stdout-h stderr-h)
           _    (update-state container-id assoc :pid (:pid res))
           wr   (syscall/waitpid (:pid res) 0)
-          exit (:status wr)]
+          exit (:status wr)
+          sg   (:signal wr)]
 
       (close! stdout-h)
       (close! stderr-h)
 
       (update-state container-id assoc
-                    :status (if (neg? exit) "killed" "exited")
+                    :status    (if (pos? sg) "killed" "exited")
                     :exit-code exit
-                    :finished (now-iso))
+                    :signal    (when (pos? sg) sg)
+                    :finished  (now-iso))
 
       (cleanup-container rootfs cg-path)
       (when (:rm? (read-state container-id))
@@ -479,12 +511,13 @@
         quiet? (:quiet? opts)
         ids    (list-container-ids)
         rows   (->> ids
-                    (map (fn [id]
-                           (try
-                             (let [st (read-state id)]
-                               (assoc st :effective-status (effective-status st)))
-                             (catch e nil))))
-                    (filter identity)
+                    (reduce (fn [acc id]
+                              (let [st (try
+                                         (let [s (read-state id)]
+                                           (assoc s :effective-status (effective-status s)))
+                                         (catch e nil))]
+                                (if st (conj acc st) acc)))
+                            [])
                     (filter (fn [s] (or all?
                                         (= "running" (:effective-status s))))))]
     (cond

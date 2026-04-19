@@ -35,13 +35,20 @@ list, stop, or reattach. After M1, lgcr feels like a runtime instead of a demo.
 - `start <id>`: re-run a stopped one (shim respawn)
 - Name suggestion parity: when printing, always show short (12-char) id
 
-**M1.3 — init-as-PID-1 correctness** (needs the elegant signal story):
-- let-go: `syscall/signal-notify` delivering signals onto an `async/chan`
-- Container `init` spawns the user command, then two go-blocks:
-  - reaper: `waitpid(-1, WNOHANG)` loop to reap orphans/zombies
-  - forwarder: receives SIGTERM/INT/QUIT from signal-chan, forwards to user PID
-- Extend `WaitResult` with `:signal` so we can record the exact signal that
-  killed a container (currently `status -1` collapses all signal deaths)
+**M1.2 — done**:
+- `ps`, `stop`, `kill`, `rm`, `inspect`, `start`
+- Prefix-id resolution (min 2 chars, ambiguity check)
+- `effective-status` catches stale "running" entries (shim-died detection)
+
+**M1.3 — done**:
+- let-go: `syscall/signal-notify` delivers signals onto an `async/chan`
+- let-go: `WaitResult` gains `:signal`; distinguishes clean exit from signal-death
+- Container `init` is now PID 1 in the namespace: spawns user command as
+  child, `waitpid(-1)` loop reaps orphans, `async/go*` forwarder relays
+  SIGTERM/INT/QUIT/HUP to the user process
+- Shim propagates `:signal` into state.json; status is `killed` when signal-died
+- Verified: SIGTERM forwarding (trap → clean exit), orphan reaping, SIGKILL
+  semantics (signal=9, status=killed)
 
 ## M2 — OCI image config
 
