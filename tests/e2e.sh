@@ -221,6 +221,18 @@ expect_contains "$OUT" "hello-from-pty" "command output via stdin"
 
 "$LGCR" rm -f "${EXID:0:6}" > /dev/null
 
+section "run -it: interactive shell, pty, winsize"
+OUT=$(printf "echo hello-run-it\nexit 7\n" | script -qc "$LGCR run -it $IMG /bin/sh" /dev/null 2>&1)
+expect_contains "$OUT" "hello-run-it" "shell saw stdin + produced output"
+
+section "run -it rejects -d"
+set +e
+OUT=$("$LGCR" run -d -it "$IMG" /bin/sh 2>&1)
+EC=$?
+set -e
+expect_eq "$EC" "1" "rc=1 on -d -it combo"
+expect_contains "$OUT" "cannot be combined" "error mentions the combination"
+
 section "exec on a stopped container errors"
 STOPID=$("$LGCR" run -d "$IMG" true 2>&1 | tail -1)
 sleep 0.5

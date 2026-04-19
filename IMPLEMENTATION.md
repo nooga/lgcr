@@ -267,10 +267,19 @@ stay CGO-free.
 **Solution**: the container's init already lives in every namespace. So
 we let init be the launcher.
 
-Each container gets a Unix socket at `$STATE_DIR/<id>/ctrl.sock`, created
-by init **before** `pivot_root` so the path lives on the host mnt and
-the listener fd outlives the mnt-ns switch. Init's accept loop waits for
-connections; each one is a request to fork a command.
+Each container gets a `SOCK_SEQPACKET` Unix socket at
+`$STATE_DIR/<id>/ctrl.sock`, created by init **before** `pivot_root` so
+the path lives on the host mnt and the listener fd outlives the mnt-ns
+switch. Init's accept loop waits for connections; each one is a request
+to fork a command. Seqpacket (not stream) is load-bearing: back-to-back
+JSON replies from init would otherwise coalesce into one recv and poison
+the client's json parser.
+
+Every user-space process in the container goes through this socket —
+`run` / `run -d` / `run -it` / `exec` all send the same request shape,
+with a `:primary true` flag on the first one. Init itself never spawns
+anything from state.json; it just runs the reaper/forwarder/accept
+loops and blocks until the primary child exits.
 
 The protocol is stupidly simple — JSON with `SCM_RIGHTS` fds:
 
@@ -335,9 +344,12 @@ we added these primitives to let-go's `syscall` namespace:
 - **`WaitResult.signal`** — `waitpid` used to flatten "exit 137" and
   "SIGKILL'd" into a single `:status -1`. Now it reports both, so we can
   tell them apart and record `:signal` in state.json.
-- **`syscall/spawn-async` opts** — an 8th optional map arg. Currently
-  understands `{:setctty? true}`, which sets `SysProcAttr.Setctty` so a
-  pty-slave stdin becomes the child's controlling terminal.
+- **`syscall/spawn-async` opts** — an 8th optional map arg. Understands
+  `{:setctty? true}` (Setctty for pty-slave stdin), `{:uid N :gid N}`
+  (drop privileges via `SysProcAttr.Credential` between fork and exec),
+  and `{:dir "/path"}` (chdir before exec via `os.ProcAttr.Dir`). These
+  moved user/workdir handling out of the global init flow and made them
+  per-request in `handle-exec-conn`.
 
 Two new namespaces landed for M3:
 

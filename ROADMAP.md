@@ -110,7 +110,28 @@ container's existing init, which is already in every namespace.
   master→stdout, SIGWINCH→`term/set-size`. Client stdin is put in raw
   mode with the saved termios restored on all exit paths.
 
-Not yet: `run -it` (for now, `run -d` + `exec -it`) and `exec --user`.
+**M3.3 — unified primary path + `run -it`**:
+- All primaries now flow through the control socket. Init no longer spawns
+  anything from state.json at boot — it sets up namespaces, creates the
+  socket, runs the reaper/forwarder/accept loops, and blocks until a
+  `:primary` request arrives and completes. `run`, `run -d`, and `run -it`
+  are all clients that open the socket and send a primary request with
+  stdio fds (for detached: shim opens log files; for `-it`: pty slave).
+- handle-exec-conn absorbed user resolution (`:user`), workdir (`:workdir`),
+  and primary tagging. `spawn-async` grew `:uid` / `:gid` / `:dir` options
+  so credential/workdir drops happen per-request instead of globally in
+  init.
+- Protocol switched to SOCK_SEQPACKET so message boundaries are preserved
+  (stream sockets let two back-to-back JSON replies glue into one recv and
+  poison the parser).
+
+`run -it` allocates a pty on the host, puts stdin raw (saved/restored on
+all exit paths), sends the slave ×3 as the primary's stdio with
+`:tty true`, closes its slave once init has SCM_RIGHTS-received it, and
+runs the same stdin→master / master→stdout / SIGWINCH forwarders as
+`exec -it`.
+
+Not yet: `exec --user`.
 
 ## M4 — security & isolation
 

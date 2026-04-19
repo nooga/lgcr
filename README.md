@@ -47,7 +47,7 @@ lgcr logs -f "$cid"
 | Command | Description |
 |---|---|
 | `lgcr pull <image>` | Fetch an OCI image (Docker Hub or any v2 registry) |
-| `lgcr run [-d] [--rm] [-e K=V] <image\|rootfs> [cmd [args...]]` | Run a container, foreground or detached |
+| `lgcr run [-d\|-it] [--rm] [-e K=V] <image\|rootfs> [cmd [args...]]` | Run a container; `-d` detach, `-it` interactive pty |
 | `lgcr exec [-it] [-e K=V] <id> <cmd> [args...]` | Run a command inside a running container; `-it` for a pty |
 | `lgcr ps [-a] [-q]` | List containers; `-a` includes exited, `-q` just ids |
 | `lgcr logs [-f] <id>` | Dump or tail captured stdout/stderr |
@@ -81,7 +81,10 @@ lgcr ps -a
 # Inspect the full lifecycle record
 lgcr inspect a1b2 | jq .
 
-# Drop into a shell inside a running container (pty, job control, resize — all wired)
+# Interactive container — exit the shell to stop the container
+lgcr run -it alpine:3.21 sh
+
+# Or: long-lived primary + ad-hoc exec sessions
 cid=$(lgcr run -d alpine:3.21 sleep infinity)
 lgcr exec -it "$cid" sh
 
@@ -117,7 +120,6 @@ lgcr exec "$cid" sh -c 'ls /proc | head'
 
 See [ROADMAP.md](./ROADMAP.md) for the plan. Short version:
 
-- No `run -it` yet — for an interactive session, `run -d` then `exec -it`
 - No networking — containers share the host network for now (M5)
 - No capability drop, seccomp, `no_new_privs` — unprivileged workloads only (M4)
 - No rootless user namespaces (M4)
