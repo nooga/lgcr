@@ -72,6 +72,9 @@
 (defn image-dir [parsed-ref]
   (lib/image-rootfs-dir (image-root) parsed-ref))
 
+(defn image-config-path [dir]
+  (str dir "/.lgcr-config.json"))
+
 (defn gen-id []
   ;; 32 hex nibbles from rand-int. Not cryptographic, but fine for uniqueness.
   (loop [n 32 acc ""]
@@ -185,8 +188,8 @@
                  false))]
       ;; Give the container a working resolver. Images ship their builder's
       ;; /etc/resolv.conf, which usually points at unreachable nameservers.
-      ;; We overwrite with the host's copy — good enough since we share the
-      ;; host network. Fall back to a public resolver if the host has none.
+      ;; We overwrite with the host's copy; host/bridge modes can use it
+      ;; directly and none mode simply ignores it.
       (let [etc-dir (lib/path-join merged "etc")
             target  (lib/path-join etc-dir "resolv.conf")
             host-rc "/etc/resolv.conf"
@@ -645,7 +648,7 @@
         base-flags (bit-or (bit-or sys/CLONE_NEWNS  sys/CLONE_NEWPID)
                            (bit-or sys/CLONE_NEWUTS sys/CLONE_NEWIPC))
         cloneflags (bit-or base-flags (net/cloneflags network))]
-    (sys/spawn-async (first argv) argv (child-env) cloneflags nil nil nil)))
+    (sys/spawn-async (first argv) argv (child-env) cloneflags nil nil *err*)))
 
 (defn- do-run-finalize
   "Write the terminal state, clean up, and exit with the mapped code."
@@ -694,8 +697,11 @@
     (let [{init-pid :pid} (do-run-spawn-init container-id)
           _    (update-state container-id assoc :pid init-pid)
           st2  (read-state container-id)
-          _    (net/setup container-id (:network st2) st2)
-          ex   (run-primary-and-wait st2 [*in* *out* *err*] false)
+          network' (net/setup container-id (:network st2) st2)
+          st3  (if network'
+                 (update-state container-id assoc :network network')
+                 st2)
+          ex   (run-primary-and-wait st3 [*in* *out* *err*] false)
           {:keys [exit signal]} (derive-exit ex (sys/waitpid init-pid 0))]
       (do-run-finalize container-id rootfs cg-path (or exit 0) (or signal 0) true))))
 
@@ -731,7 +737,10 @@
           sz       (term/size)
           saved    (term/raw-mode! *in*)
           st2      (read-state container-id)
-          _        (net/setup container-id (:network st2) st2)]
+          network' (net/setup container-id (:network st2) st2)
+          st3      (if network'
+                     (update-state container-id assoc :network network')
+                     st2)]
       (when-let [[cols rows] sz] (term/set-size master cols rows))
       ;; stdin → master
       (go
@@ -757,7 +766,7 @@
                 (when-let [[cols rows] (term/size)]
                   (try (term/set-size master cols rows) (catch e nil)))
                 (recur)))))
-        (let [conn (send-primary st2 [slave slave slave] true
+        (let [conn (send-primary st3 [slave slave slave] true
                                  (fn [] (try (unix/close slave) (catch e nil))))
               {:keys [exit signal]} (derive-exit (read-exited conn)
                                                  (sys/waitpid init-pid 0))]
@@ -779,15 +788,14 @@
   (if (and (str/starts-with? target "/") (exists? target))
     {:rootfs target :config nil}
     (let [ref (lib/parse-image-ref target)
-          dir (image-dir ref)]
-      (when-not (exists? dir)
+          dir (image-dir ref)
+          cfg (image-config-path dir)]
+      (when-not (exists? cfg)
         (do-pull target)
-        (when-not (exists? dir)
-          (die "image pull did not produce rootfs: " dir)))
+        (when-not (exists? cfg)
+          (die "image pull did not produce config: " cfg)))
       {:rootfs dir
-       :config (let [p (str dir "/.lgcr-config.json")]
-                 (when (exists? p)
-                   (json/read-json (slurp p) {:keywords? true})))})))
+       :config (json/read-json (slurp cfg) {:keywords? true})})))
 
 ;; strip-nils + compose-command live in lib.lg
 
@@ -879,9 +887,12 @@
     (let [{init-pid :pid} (do-run-spawn-init container-id)
           _       (update-state container-id assoc :pid init-pid)
           st2     (read-state container-id)
-          _       (net/setup container-id (:network st2) st2)
+          network' (net/setup container-id (:network st2) st2)
+          st3     (if network'
+                    (update-state container-id assoc :network network')
+                    st2)
           null-in (open "/dev/null" :read)
-          ex      (run-primary-and-wait st2 [null-in stdout-h stderr-h] false)]
+          ex      (run-primary-and-wait st3 [null-in stdout-h stderr-h] false)]
       (close! null-in)
       (let [{:keys [exit signal]} (derive-exit ex (sys/waitpid init-pid 0))]
         (close! stdout-h)
@@ -1219,19 +1230,18 @@
 
       ;; fetch manifest (could be a manifest list or a single manifest)
       (println "[pull] fetching manifest...")
-      (let [resp     (registry-get registry repo (str "/manifests/" tag) token {})
-            body     (json/read-json (:body resp) {:keywords? true})
+      (let [resp       (registry-get registry repo (str "/manifests/" tag) token {})
+            body       (json/read-json (:body resp) {:keywords? true})
             media-type (or (:mediaType body)
-                          (get (:headers resp) "content-type"))]
+                           (get (:headers resp) "content-type"))]
 
         ;; handle manifest list / OCI index → pick platform, fetch actual manifest
         (let [manifest
               (if (or (str/includes? (str media-type) "manifest.list")
                       (str/includes? (str media-type) "image.index"))
                 ;; it's a fat manifest — pick our platform
-                (if-let [{:keys [digest mediaType]}
-                         (pick-manifest (:manifests body) our-arch "linux")]
-                  (do
+                (if-let [selected (pick-manifest (:manifests body) our-arch "linux")]
+                  (let [{:keys [digest mediaType]} selected]
                     (println (str "[pull] selected platform: " our-arch "/linux"))
                     (let [resp2 (registry-get registry repo (str "/manifests/" digest) token
                                               {:accept mediaType})]
@@ -1243,56 +1253,63 @@
               layers (:layers manifest)]
 
           (println (str "[pull] " (count layers) " layers to download"))
-          (sh! "mkdir" "-p" rootfs-dir)
+          (try
+            ;; Start from a clean target dir so a failed or interrupted earlier
+            ;; pull cannot leave behind a misleading partial cache entry.
+            (try (sys/rm-rf rootfs-dir) (catch e nil))
+            (sh! "mkdir" "-p" rootfs-dir)
 
-          ;; download and extract each layer
-          (doseq [{:keys [digest size]} layers]
-            (let [short-dig (subs digest 7 19) ;; sha256:xxxx... → first 12 hex chars
-                  tmp-file  (str "/tmp/layer-" short-dig ".tar.gz")]
+            ;; download and extract each layer
+            (doseq [{:keys [digest size]} layers]
+              (let [short-dig (subs digest 7 19) ;; sha256:xxxx... → first 12 hex chars
+                    tmp-file  (str "/tmp/layer-" short-dig ".tar.gz")]
 
-              (println (str "[pull] layer " short-dig " (" size " bytes)"))
+                (println (str "[pull] layer " short-dig " (" size " bytes)"))
 
-              ;; stream download
-              (let [resp (registry-get registry repo (str "/blobs/" digest) token
-                                       {:accept "application/octet-stream"
-                                        :as     :stream})
-                    w    (io/writer tmp-file)]
-                (io/copy (:body resp) w)
-                (io/close w)
-                (io/close (:body resp)))
+                ;; stream download
+                (let [resp (registry-get registry repo (str "/blobs/" digest) token
+                                         {:accept "application/octet-stream"
+                                          :as     :stream})
+                      w    (io/writer tmp-file)]
+                  (io/copy (:body resp) w)
+                  (io/close w)
+                  (io/close (:body resp)))
 
-              ;; extract layer
-              (sh! "tar" "xzf" tmp-file "-C" rootfs-dir)
-              (sh! "rm" "-f" tmp-file)))
+                ;; extract layer
+                (sh! "tar" "xzf" tmp-file "-C" rootfs-dir)
+                (sh! "rm" "-f" tmp-file)))
 
-          ;; fetch image config blob (ENTRYPOINT/CMD/ENV/WORKDIR/USER)
-          (when-let [{cfg-digest :digest} (:config manifest)]
-            (println "[pull] fetching image config...")
-            (let [resp (registry-get registry repo (str "/blobs/" cfg-digest) token
-                                     {:accept "application/octet-stream"})
-                  {:keys [config architecture]} (json/read-json (:body resp) {:keywords? true})
-                  {:keys [Env Cmd Entrypoint WorkingDir User]} config
-                  img-arch (or architecture "")]
-              (when (and (not= "" img-arch) (not= img-arch our-arch))
-                ;; wipe the partial rootfs so we don't leave a broken image
-                ;; around (and so a retry with a matching arch works cleanly)
-                (try (sys/rm-rf rootfs-dir) (catch e nil))
-                (die "image is " img-arch " but host is " our-arch
-                     " — no " our-arch " variant is available for "
-                     repo ":" tag))
-              (let [reduced {:env          (or Env [])
-                             :cmd          (or Cmd [])
-                             :entrypoint   (or Entrypoint [])
-                             :workdir      (or WorkingDir "")
-                             :user         (or User "")
-                             :ref          (str repo ":" tag)
-                             :registry     registry
-                             :pulled-epoch (now-epoch)}]
-                (spit (str rootfs-dir "/.lgcr-config.json")
-                      (json/write-json reduced)))))
+            ;; fetch image config blob (ENTRYPOINT/CMD/ENV/WORKDIR/USER)
+            (when-let [{cfg-digest :digest} (:config manifest)]
+              (println "[pull] fetching image config...")
+              (let [resp (registry-get registry repo (str "/blobs/" cfg-digest) token
+                                       {:accept "application/octet-stream"})
+                    {:keys [config architecture]} (json/read-json (:body resp) {:keywords? true})
+                    {:keys [Env Cmd Entrypoint WorkingDir User]} config
+                    img-arch (or architecture "")]
+                (when (and (not= "" img-arch) (not= img-arch our-arch))
+                  ;; wipe the partial rootfs so we don't leave a broken image
+                  ;; around (and so a retry with a matching arch works cleanly)
+                  (try (sys/rm-rf rootfs-dir) (catch e nil))
+                  (die "image is " img-arch " but host is " our-arch
+                       " — no " our-arch " variant is available for "
+                       repo ":" tag))
+                (let [reduced {:env          (or Env [])
+                               :cmd          (or Cmd [])
+                               :entrypoint   (or Entrypoint [])
+                               :workdir      (or WorkingDir "")
+                               :user         (or User "")
+                               :ref          (str repo ":" tag)
+                               :registry     registry
+                               :pulled-epoch (now-epoch)}]
+                  (spit (image-config-path rootfs-dir)
+                        (json/write-json reduced)))))
 
-          (println (str "[pull] rootfs ready at " rootfs-dir))
-          rootfs-dir)))))
+            (println (str "[pull] rootfs ready at " rootfs-dir))
+            rootfs-dir
+            (catch e
+              (try (sys/rm-rf rootfs-dir) (catch e2 nil))
+              (throw e))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; images — list / remove
@@ -1321,17 +1338,19 @@
            (fn [acc name]
              (if (= "" name)
                acc
-               (let [dir  (str root "/" name)
-                     {:keys [ref pulled-epoch]}
-                     (let [p (str dir "/.lgcr-config.json")]
-                       (when (exists? p)
-                         (try (json/read-json (slurp p) {:keywords? true})
-                              (catch e nil))))]
-                 (conj acc {:dir          dir
-                            :subdir       name
-                            :ref          (or ref name)
-                            :pulled-epoch pulled-epoch
-                            :size         (dir-size-bytes dir)}))))
+               (let [dir    (str root "/" name)
+                     config (let [p (image-config-path dir)]
+                              (when (exists? p)
+                                (try (json/read-json (slurp p) {:keywords? true})
+                                     (catch e nil))))]
+                 (if-not config
+                   acc
+                   (let [{:keys [ref pulled-epoch]} config]
+                     (conj acc {:dir          dir
+                                :subdir       name
+                                :ref          ref
+                                :pulled-epoch pulled-epoch
+                                :size         (dir-size-bytes dir)}))))))
            []
            (str/split (:out ls) "\n"))
           []))
@@ -1465,7 +1484,7 @@
                             "--hostname" [:hostname :value]}
                            tail)]
       (if (< (count rest-args) 1)
-        (die "usage: lgcr run [-d|-it] [--rm] [--read-only] [--net host|none] [--tmpfs DST[:opts]] [-e K=V]... [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image-or-rootfs> [command [args...]]")
+        (die "usage: lgcr run [-d|-it] [--rm] [--read-only] [--net host|none|bridge] [--tmpfs DST[:opts]] [-e K=V]... [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image-or-rootfs> [command [args...]]")
         (do-run (first rest-args)
                 (second rest-args)       ;; nil if not given
                 (vec (drop 2 rest-args))
@@ -1564,7 +1583,7 @@
       (println "let-go container runtime")
       (println)
       (println "usage:")
-      (println "  lgcr run [-d] [--rm] [--read-only] [--net host|none] [--tmpfs DST[:opts]] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <rootfs-dir> <command> [args...]")
+      (println "  lgcr run [-d] [--rm] [--read-only] [--net host|none|bridge] [--tmpfs DST[:opts]] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <rootfs-dir> <command> [args...]")
       (println "  lgcr ps [-a] [-q]")
       (println "  lgcr logs [-f] <id>")
       (println "  lgcr stop [-t SECS] <id>...")

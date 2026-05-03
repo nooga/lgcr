@@ -148,7 +148,7 @@ lgcr exec "$cid" sh -c 'ls /proc | head'
 
 See [ROADMAP.md](./ROADMAP.md) for the plan. Short version:
 
-- Only `--net host|none` networking — no bridge/NAT or port publishing yet (M5)
+- No published ports yet; bridge networking provides isolated outbound connectivity, but there is still no `-p`/port-forwarding support (M5)
 - No capability drop, seccomp, `no_new_privs` — unprivileged workloads only (M4)
 - No rootless user namespaces (M4)
 - No image build (M7 — a Lisp-macro DSL called `defcontainer` is planned)

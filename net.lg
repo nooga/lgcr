@@ -1,7 +1,13 @@
 (ns net
-  (:require [syscall :as sys]))
+  (:require [syscall :as sys]
+            [string :as str]
+            [lib :as lib]))
 
 (def DEFAULT-NETWORK {:type :host})
+(def DEFAULT-BRIDGE-NAME "lgcr0")
+(def DEFAULT-BRIDGE-SUBNET "10.231.0.0/16")
+(def DEFAULT-BRIDGE-GATEWAY "10.231.0.1")
+(def DEFAULT-BRIDGE-GATEWAY-CIDR "10.231.0.1/16")
 
 (defn normalize
   "Return a network map with a keyword :type. JSON round-trips keyword values
@@ -14,6 +20,79 @@
                            (keyword? t) t
                            :else (keyword t)))))
 
+(defn sh!
+  [& args]
+  (let [result (apply os/sh args)]
+    (when (not= 0 (:exit result))
+      (throw (str "command failed: " (str/join " " args) "\n" (:err result))))
+    result))
+
+(defn try-sh!
+  [& args]
+  (try
+    (apply sh! args)
+    (catch e nil)))
+
+(defn ensure-iptables-rule
+  [table chain rule]
+  (let [prefix     (if table ["iptables" "-t" table] ["iptables"])
+        check-args (into (into prefix ["-C" chain]) rule)
+        add-args   (into (into prefix ["-A" chain]) rule)
+        result     (apply os/sh check-args)]
+    (when (not= 0 (:exit result))
+      (apply sh! add-args))))
+
+(defn ensure-bridge
+  [bridge-name]
+  (when (not= 0 (:exit (os/sh "ip" "link" "show" "dev" bridge-name)))
+    (sh! "ip" "link" "add" "name" bridge-name "type" "bridge"))
+  (when (not (str/includes? (:out (os/sh "ip" "-4" "addr" "show" "dev" bridge-name))
+                            DEFAULT-BRIDGE-GATEWAY-CIDR))
+    (try-sh! "ip" "addr" "add" DEFAULT-BRIDGE-GATEWAY-CIDR "dev" bridge-name))
+  (sh! "ip" "link" "set" bridge-name "up")
+  (sh! "sysctl" "-w" "net.ipv4.ip_forward=1")
+  (ensure-iptables-rule "nat" "POSTROUTING"
+                        ["-s" DEFAULT-BRIDGE-SUBNET
+                         "!" "-o" bridge-name
+                         "-j" "MASQUERADE"])
+  (ensure-iptables-rule nil "FORWARD"
+                        ["-i" bridge-name "-j" "ACCEPT"])
+  (ensure-iptables-rule nil "FORWARD"
+                        ["-o" bridge-name
+                         "-m" "conntrack" "--ctstate" "RELATED,ESTABLISHED"
+                         "-j" "ACCEPT"]))
+
+(defn hex-char-int
+  [c]
+  (str/index-of lib/HEX-CHARS (str c)))
+
+(defn bridge-ip-for-id
+  [container-id]
+  (let [[a b c d] (take 4 container-id)
+        third (+ (* 16 (hex-char-int a)) (hex-char-int b))
+        raw-fourth (+ (* 16 (hex-char-int c)) (hex-char-int d))
+        fourth (+ 2 (mod raw-fourth 253))]
+    (str "10.231." third "." fourth)))
+
+(defn host-if-name
+  [container-id]
+  (str "lgv" (subs container-id 0 8)))
+
+(defn peer-if-name
+  [container-id]
+  (str "lgp" (subs container-id 0 8)))
+
+(defn ensure-bridge-resolver
+  [merged]
+  (let [etc-dir  (lib/path-join merged "etc")
+        target   (lib/path-join etc-dir "resolv.conf")
+        current  (try (slurp target) (catch e ""))]
+    (when (or (= "" current)
+              (str/includes? current "nameserver 127.")
+              (str/includes? current "nameserver ::1"))
+      (sys/mkdir-p etc-dir 0755)
+      (spit target "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"))))
+
 (defmulti cloneflags (fn [network] (:type (normalize network))))
 (defmulti setup (fn [container-id network state] (:type (normalize network))))
 (defmulti cleanup (fn [container-id network state] (:type (normalize network))))
@@ -24,23 +103,63 @@
 (defmethod cloneflags :none [_]
   sys/CLONE_NEWNET)
 
+(defmethod cloneflags :bridge [_]
+  sys/CLONE_NEWNET)
+
 (defmethod cloneflags :default [network]
   (throw (str "unsupported network type: " (:type (normalize network)))))
 
-(defmethod setup :host [_id _network _state]
+(defmethod setup :host [_id network _state]
   nil)
 
-(defmethod setup :none [_id _network _state]
+(defmethod setup :none [_id network {:keys [pid]}]
+  (when pid
+    (sh! "nsenter" "-t" (str pid) "-n" "ip" "link" "set" "lo" "up"))
   nil)
+
+(defmethod setup :bridge [container-id network {:keys [pid rootfs-merged]}]
+  (let [{:keys [name]} (normalize network)
+        bridge-name (or name DEFAULT-BRIDGE-NAME)
+        host-if     (host-if-name container-id)
+        peer-if     (peer-if-name container-id)
+        ip          (bridge-ip-for-id container-id)]
+    (ensure-bridge bridge-name)
+    (when rootfs-merged
+      (ensure-bridge-resolver rootfs-merged))
+    ;; Reclaim any stale host veth from a previous failed cleanup before
+    ;; building the fresh pair for this container id.
+    (try-sh! "ip" "link" "del" host-if)
+    (sh! "ip" "link" "add" host-if "type" "veth" "peer" "name" peer-if)
+    (sh! "ip" "link" "set" host-if "master" bridge-name)
+    (sh! "ip" "link" "set" host-if "up")
+    (sh! "ip" "link" "set" peer-if "netns" (str pid))
+    (sh! "nsenter" "-t" (str pid) "-n" "ip" "link" "set" "lo" "up")
+    (sh! "nsenter" "-t" (str pid) "-n" "ip" "link" "set" peer-if "name" "eth0")
+    (sh! "nsenter" "-t" (str pid) "-n" "ip" "addr" "add" (str ip "/16") "dev" "eth0")
+    (sh! "nsenter" "-t" (str pid) "-n" "ip" "link" "set" "eth0" "up")
+    (sh! "nsenter" "-t" (str pid) "-n" "ip" "route" "add" "default" "via" DEFAULT-BRIDGE-GATEWAY)
+    (assoc (normalize network)
+           :bridge-name bridge-name
+           :subnet DEFAULT-BRIDGE-SUBNET
+           :gateway DEFAULT-BRIDGE-GATEWAY
+           :host-if host-if
+           :container-if "eth0"
+           :ip ip)))
 
 (defmethod setup :default [_id network _state]
   (throw (str "unsupported network type: " (:type (normalize network)))))
 
-(defmethod cleanup :host [_id _network _state]
-  nil)
+(defmethod cleanup :host [_id network _state]
+  (normalize network))
 
-(defmethod cleanup :none [_id _network _state]
-  nil)
+(defmethod cleanup :none [_id network _state]
+  (normalize network))
+
+(defmethod cleanup :bridge [container-id network _state]
+  (let [{:keys [host-if]} (normalize network)
+        host-if (or host-if (host-if-name container-id))]
+    (try-sh! "ip" "link" "del" host-if)
+    (normalize network)))
 
 (defmethod cleanup :default [_id network _state]
   (throw (str "unsupported network type: " (:type (normalize network)))))

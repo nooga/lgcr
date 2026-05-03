@@ -263,6 +263,7 @@
     (cond
       (= spec "host") {:type :host}
       (= spec "none") {:type :none}
+      (= spec "bridge") {:type :bridge :name "lgcr0"}
       :else (on-err (str "unsupported network: " spec)))))
 
 ;; ---------------------------------------------------------------------------

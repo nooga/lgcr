@@ -249,7 +249,9 @@
 
 (deftest parse-network-spec-known-drivers
   (is (= {:type :host} (lib/parse-network-spec "host" throw-err)))
-  (is (= {:type :none} (lib/parse-network-spec "none" throw-err))))
+  (is (= {:type :none} (lib/parse-network-spec "none" throw-err)))
+  (is (= {:type :bridge :name "lgcr0"}
+         (lib/parse-network-spec "bridge" throw-err))))
 
 ;; ---------------------------------------------------------------------------
 ;; parse-signal

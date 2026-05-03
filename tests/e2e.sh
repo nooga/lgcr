@@ -225,13 +225,52 @@ else
     echo "  FAIL [${CURRENT}] none network namespace did not differ: default=$DEFAULT_NETNS none=$NONE_NETNS"
 fi
 
+section "run --net bridge configures eth0, a default route, and gateway reachability"
+OUT=$("$LGCR" run --net=bridge "$IMG" sh -c "readlink /proc/self/ns/net; cat /sys/class/net/eth0/operstate; if awk '\$2 == \"00000000\" { found=1 } END { exit(found ? 0 : 1) }' /proc/net/route; then echo DEFAULT_ROUTE; fi; if ping -c 1 -W 2 10.231.0.1 >/dev/null 2>&1; then echo GATEWAY_OK; fi" 2>&1)
+BRIDGE_NETNS=$(echo "$OUT" | grep -E 'net:\[[0-9]+\]' | tail -1)
+if [ "$BRIDGE_NETNS" != "$DEFAULT_NETNS" ] && [ -n "$BRIDGE_NETNS" ]; then
+    PASS=$((PASS + 1))
+    echo "  ok  bridge network namespace differs"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL [${CURRENT}] bridge network namespace did not differ: default=$DEFAULT_NETNS bridge=$BRIDGE_NETNS"
+fi
+expect_contains "$OUT" "up" "bridge eth0 is up"
+expect_contains "$OUT" "DEFAULT_ROUTE" "bridge default route present"
+expect_contains "$OUT" "GATEWAY_OK" "bridge gateway reachable"
+
+section "run --net bridge can reach the internet through NAT"
+OUT=$("$LGCR" run --net bridge "$IMG" sh -c "wget -qO- http://example.com | grep -qi example && echo OUTBOUND_OK" 2>&1)
+expect_contains "$OUT" "OUTBOUND_OK" "bridge outbound connectivity"
+
+section "run --net bridge cleans up host veth on rm -f"
+BCID=$("$LGCR" run -d --net bridge "$IMG" sleep 30 2>&1 | tail -1)
+sleep 1
+BHOST_IF="lgv${BCID:0:8}"
+if ip link show "$BHOST_IF" >/dev/null 2>&1; then
+    PASS=$((PASS + 1))
+    echo "  ok  bridge host veth exists while container runs"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL [${CURRENT}] bridge host veth missing while container runs: $BHOST_IF"
+fi
+"$LGCR" rm -f "${BCID:0:6}" > /dev/null
+sleep 1
+if ip link show "$BHOST_IF" >/dev/null 2>&1; then
+    FAIL=$((FAIL + 1))
+    echo "  FAIL [${CURRENT}] bridge host veth still exists after cleanup: $BHOST_IF"
+else
+    PASS=$((PASS + 1))
+    echo "  ok  bridge host veth removed on cleanup"
+fi
+
 section "run --net rejects unsupported network drivers"
 set +e
-OUT=$("$LGCR" run --net=bridge "$IMG" true 2>&1)
+OUT=$("$LGCR" run --net=weird "$IMG" true 2>&1)
 RC=$?
 set -e
 expect_eq "$RC" "1" "invalid network rc"
-expect_contains "$OUT" "unsupported network: bridge" "invalid network error"
+expect_contains "$OUT" "unsupported network: weird" "invalid network error"
 
 section "bind mount -v exposes host directory read-write"
 BIND_DIR="$(pwd)/.tmp-lgcr-bind-$$"
@@ -469,6 +508,9 @@ OUT=$("$LGCR" prune 2>&1)
 expect_contains "$OUT" "pruned" "default prunes both"
 sleep 1
 expect_eq "$("$LGCR" ps -aq | wc -l | tr -d ' ')" "0" "no containers left"
+OUT=$("$LGCR" images -q 2>&1 || true)
+expect_not_contains "$OUT" "library/alpine:3.21" "prune removed alpine from image listing"
+expect_not_contains "$OUT" "hello-world" "prune removed hello-world from image listing"
 
 section "rmi removes an unused image"
 "$LGCR" pull hello-world > /dev/null 2>&1

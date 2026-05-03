@@ -23,7 +23,7 @@ New pure helpers go in `lib.lg` so they're testable in isolation —
 
 - `pull`: real OCI registry client (manifest list resolution, token auth, streaming layer download)
 - `run`: overlay rootfs + namespaces (mnt/pid/uts/ipc) + cgroups v2 limits
-- `run --net host|none`: explicit host networking or an isolated empty net namespace
+- `run --net host|none|bridge`: explicit host networking, an isolated empty net namespace, or a bridge-backed namespace with NAT egress
 - `run -v` / `--mount`: host bind mounts, including read-only remounts
 - `run --tmpfs`: user-specified tmpfs mounts inside the container
 - `run --read-only`: read-only rootfs with writable `/tmp` and `/run` tmpfs mounts
