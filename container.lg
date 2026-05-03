@@ -207,11 +207,7 @@
     (sh! "mkdir" "-p" cg-path)
     ;; memory limit
     (when-let [mem (:memory limits)]
-      (let [bytes (cond
-                    (str/ends-with? mem "g") (str (* (parse-int (subs mem 0 (- (count mem) 1))) 1073741824))
-                    (str/ends-with? mem "m") (str (* (parse-int (subs mem 0 (- (count mem) 1))) 1048576))
-                    (str/ends-with? mem "k") (str (* (parse-int (subs mem 0 (- (count mem) 1))) 1024))
-                    :else mem)]
+      (let [bytes (lib/parse-memory-size mem)]
         (sys/write-file (lib/path-join cg-path "memory.max") bytes 0644)))
     ;; cpu limit (microseconds quota per period)
     (when-let [cpu (:cpu limits)]

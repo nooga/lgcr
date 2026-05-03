@@ -35,6 +35,19 @@
   (is (= false (lib/numeric? nil))))
 
 ;; ---------------------------------------------------------------------------
+;; parse-memory-size
+;; ---------------------------------------------------------------------------
+
+(deftest parse-memory-size-suffixes
+  (is (= "1024" (lib/parse-memory-size "1k")))
+  (is (= "536870912" (lib/parse-memory-size "512m")))
+  (is (= "1073741824" (lib/parse-memory-size "1g"))))
+
+(deftest parse-memory-size-passes-through-plain-values
+  (is (= "max" (lib/parse-memory-size "max")))
+  (is (= "1048576" (lib/parse-memory-size "1048576"))))
+
+;; ---------------------------------------------------------------------------
 ;; strip-nils
 ;; ---------------------------------------------------------------------------
 

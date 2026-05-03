@@ -53,6 +53,22 @@
                  (and acc (>= (int c) (int \0)) (<= (int c) (int \9))))
                true (seq s))))
 
+(defn parse-memory-size
+  "Parse cgroup memory size strings like 512m, 1g, or 64k into bytes.
+   Values without a recognized suffix pass through unchanged."
+  [mem]
+  (cond
+    (str/ends-with? mem "g")
+    (str (* (parse-int (subs mem 0 (- (count mem) 1))) 1073741824))
+
+    (str/ends-with? mem "m")
+    (str (* (parse-int (subs mem 0 (- (count mem) 1))) 1048576))
+
+    (str/ends-with? mem "k")
+    (str (* (parse-int (subs mem 0 (- (count mem) 1))) 1024))
+
+    :else mem))
+
 (defn strip-nils
   "Drop nil entries; JSON null in an array lands as nil after decode."
   [xs]
