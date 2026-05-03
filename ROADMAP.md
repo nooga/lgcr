@@ -23,6 +23,7 @@ New pure helpers go in `lib.lg` so they're testable in isolation —
 
 - `pull`: real OCI registry client (manifest list resolution, token auth, streaming layer download)
 - `run`: overlay rootfs + namespaces (mnt/pid/uts/ipc) + cgroups v2 limits
+- `run --net host|none`: explicit host networking or an isolated empty net namespace
 - `run -v` / `--mount`: host bind mounts, including read-only remounts
 - `run --tmpfs`: user-specified tmpfs mounts inside the container
 - `run --read-only`: read-only rootfs with writable `/tmp` and `/run` tmpfs mounts
@@ -168,9 +169,8 @@ of the defense-in-depth layers is a namespace trick, not isolation.
 
 The biggest optional chunk. Order of increasing cost:
 
-- `--net=host`: skip CLONE_NEWNET. Trivial.
-- `--net=none`: CLONE_NEWNET + don't configure anything. Cheap, useful for
-  build/isolation workloads.
+- `--net=host` / `--net=none` — done. Implemented through `net.lg`
+  multimethod drivers so later bridge/container drivers have the same shape.
 - Bridge networking: veth pair, host-side bridge, NAT, basic DHCP or static
   IPAM, `-p` port forwarding via iptables/nftables rules. Real work.
 - Defer until actual use cases drive the direction — "every container needs

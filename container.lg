@@ -15,6 +15,7 @@
             [term :as term]
             [string :as str]
             [io :as io]
+            [net :as net]
             [lib :as lib]))
 
 ;; ---------------------------------------------------------------------------
@@ -124,7 +125,8 @@
 (defn state-path [id] (str (container-dir id) "/state.json"))
 
 (defn read-state [id]
-  (json/read-json (slurp (state-path id)) {:keywords? true}))
+  (let [state (json/read-json (slurp (state-path id)) {:keywords? true})]
+    (assoc state :network (net/normalize (:network state)))))
 
 (defn write-state [{:keys [id] :as state}]
   (sys/mkdir-p (container-dir id) 0755)
@@ -606,7 +608,8 @@
       (pos? wr-sg)     {:exit 0 :signal wr-sg}
       :else            {:exit (or (:status init-wr) 0) :signal 0})))
 
-(defn cleanup-container [{:keys [merged run-dir mounts tmpfs-mounts read-only?]} cg-path]
+(defn cleanup-container [{:keys [id merged run-dir mounts tmpfs-mounts read-only? network] :as state} cg-path]
+  (net/cleanup id network state)
   (unmount-tmpfs-mounts merged tmpfs-mounts)
   (when read-only?
     (unmount-tmpfs-mounts merged READONLY-TMPFS-MOUNTS))
@@ -638,8 +641,10 @@
    (primary's stdio flows through the control socket via SCM_RIGHTS)."
   [container-id]
   (let [argv       (into (self-prefix) ["init" container-id])
-        cloneflags (bit-or (bit-or sys/CLONE_NEWNS  sys/CLONE_NEWPID)
-                           (bit-or sys/CLONE_NEWUTS sys/CLONE_NEWIPC))]
+        network    (:network (read-state container-id))
+        base-flags (bit-or (bit-or sys/CLONE_NEWNS  sys/CLONE_NEWPID)
+                           (bit-or sys/CLONE_NEWUTS sys/CLONE_NEWIPC))
+        cloneflags (bit-or base-flags (net/cloneflags network))]
     (sys/spawn-async (first argv) argv (child-env) cloneflags nil nil nil)))
 
 (defn- do-run-finalize
@@ -664,10 +669,12 @@
                :else                exit-code))))
 
 (defn do-run-foreground [container-id]
-  (let [{:keys [rootfs-src limits mounts tmpfs-mounts read-only?]} (read-state container-id)
+  (let [{:keys [rootfs-src limits mounts tmpfs-mounts read-only? network]} (read-state container-id)
         rootfs  (assoc (setup-rootfs rootfs-src container-id)
+                       :id container-id
                        :mounts mounts
                        :tmpfs-mounts tmpfs-mounts
+                       :network network
                        :read-only? read-only?)
         cg-path (when (seq limits) (setup-cgroups container-id limits))
         {:keys [merged run-dir]} rootfs]
@@ -687,6 +694,7 @@
     (let [{init-pid :pid} (do-run-spawn-init container-id)
           _    (update-state container-id assoc :pid init-pid)
           st2  (read-state container-id)
+          _    (net/setup container-id (:network st2) st2)
           ex   (run-primary-and-wait st2 [*in* *out* *err*] false)
           {:keys [exit signal]} (derive-exit ex (sys/waitpid init-pid 0))]
       (do-run-finalize container-id rootfs cg-path (or exit 0) (or signal 0) true))))
@@ -699,10 +707,12 @@
   [container-id]
   (when-not (term/tty? *in*)
     (die "the input device is not a TTY"))
-  (let [{:keys [rootfs-src limits mounts tmpfs-mounts read-only?]} (read-state container-id)
+  (let [{:keys [rootfs-src limits mounts tmpfs-mounts read-only? network]} (read-state container-id)
         rootfs  (assoc (setup-rootfs rootfs-src container-id)
+                       :id container-id
                        :mounts mounts
                        :tmpfs-mounts tmpfs-mounts
+                       :network network
                        :read-only? read-only?)
         cg-path (when (seq limits) (setup-cgroups container-id limits))
         {:keys [merged run-dir]} rootfs]
@@ -720,7 +730,8 @@
           {:keys [master slave]} (term/open-pty)
           sz       (term/size)
           saved    (term/raw-mode! *in*)
-          st2      (read-state container-id)]
+          st2      (read-state container-id)
+          _        (net/setup container-id (:network st2) st2)]
       (when-let [[cols rows] sz] (term/set-size master cols rows))
       ;; stdin → master
       (go
@@ -781,13 +792,14 @@
 ;; strip-nils + compose-command live in lib.lg
 
 (defn do-run [target user-cmd user-args
-              {:keys [detached? tty? rm? extra-env hostname workdir mounts tmpfs read-only?] :as opts}]
+              {:keys [detached? tty? rm? extra-env hostname workdir mounts tmpfs network read-only?] :as opts}]
   (let [{:keys [rootfs config]} (resolve-run-target target)
         [command args] (lib/compose-command config user-cmd user-args die)
         container-id (gen-id)
         hostname     (or hostname (str "lg-" (lib/short-id container-id)))
         mounts       (lib/parse-mount-specs mounts die)
         tmpfs-mounts (lib/parse-tmpfs-specs tmpfs die)
+        network      (lib/parse-network-spec network die)
         limits       (select-keys opts [:memory :cpu :pids])
         {cfg-workdir :workdir cfg-user :user cfg-env :env} config]
     (when (and detached? tty?)
@@ -810,6 +822,7 @@
                     :env           (or extra-env [])
                     :mounts        mounts
                     :tmpfs-mounts  tmpfs-mounts
+                    :network       network
                     :read-only?    (boolean read-only?)
                     :limits        limits
                     :detached?     (boolean detached?)
@@ -841,13 +854,15 @@
 ;; ---------------------------------------------------------------------------
 
 (defn do-shim [container-id]
-  (let [{:keys [rootfs-src limits mounts tmpfs-mounts read-only?]} (read-state container-id)
+  (let [{:keys [rootfs-src limits mounts tmpfs-mounts network read-only?]} (read-state container-id)
         dir       (container-dir container-id)
         stdout-h  (open (str dir "/stdout.log") :write)
         stderr-h  (open (str dir "/stderr.log") :write)
         rootfs    (assoc (setup-rootfs rootfs-src container-id)
+                         :id container-id
                          :mounts mounts
                          :tmpfs-mounts tmpfs-mounts
+                         :network network
                          :read-only? read-only?)
         cg-path   (when (seq limits) (setup-cgroups container-id limits))
         {:keys [merged run-dir]} rootfs]
@@ -864,6 +879,7 @@
     (let [{init-pid :pid} (do-run-spawn-init container-id)
           _       (update-state container-id assoc :pid init-pid)
           st2     (read-state container-id)
+          _       (net/setup container-id (:network st2) st2)
           null-in (open "/dev/null" :read)
           ex      (run-primary-and-wait st2 [null-in stdout-h stderr-h] false)]
       (close! null-in)
@@ -970,7 +986,7 @@
 
 (defn do-rm [id-prefix force?]
   (let [id (require-id id-prefix)
-        {:keys [pid rootfs-merged run-dir cgroup mounts tmpfs-mounts read-only?] :as state} (read-state id)
+        {:keys [pid rootfs-merged run-dir cgroup mounts tmpfs-mounts network read-only?] :as state} (read-state id)
         status (effective-status state)]
     (cond
       (and (= status "running") (not force?))
@@ -982,6 +998,7 @@
           (sleep 200)))
     ;; cleanup leftover overlay / cgroup just in case the shim didn't finish
     (when rootfs-merged
+      (net/cleanup id network state)
       (unmount-tmpfs-mounts rootfs-merged tmpfs-mounts)
       (when read-only?
         (unmount-tmpfs-mounts rootfs-merged READONLY-TMPFS-MOUNTS))
@@ -1439,6 +1456,8 @@
                             "-v"   [:mounts    :accumulate]
                             "--mount" [:mounts :accumulate]
                             "--tmpfs" [:tmpfs :accumulate]
+                            "--net" [:network :value]
+                            "--network" [:network :value]
                             "--read-only" [:read-only? :bool]
                             "-w" [:workdir :value]
                             "--workdir" [:workdir :value]
@@ -1446,7 +1465,7 @@
                             "--hostname" [:hostname :value]}
                            tail)]
       (if (< (count rest-args) 1)
-        (die "usage: lgcr run [-d|-it] [--rm] [--read-only] [--tmpfs DST[:opts]] [-e K=V]... [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image-or-rootfs> [command [args...]]")
+        (die "usage: lgcr run [-d|-it] [--rm] [--read-only] [--net host|none] [--tmpfs DST[:opts]] [-e K=V]... [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image-or-rootfs> [command [args...]]")
         (do-run (first rest-args)
                 (second rest-args)       ;; nil if not given
                 (vec (drop 2 rest-args))
@@ -1545,7 +1564,7 @@
       (println "let-go container runtime")
       (println)
       (println "usage:")
-      (println "  lgcr run [-d] [--rm] [--read-only] [--tmpfs DST[:opts]] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <rootfs-dir> <command> [args...]")
+      (println "  lgcr run [-d] [--rm] [--read-only] [--net host|none] [--tmpfs DST[:opts]] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <rootfs-dir> <command> [args...]")
       (println "  lgcr ps [-a] [-q]")
       (println "  lgcr logs [-f] <id>")
       (println "  lgcr stop [-t SECS] <id>...")

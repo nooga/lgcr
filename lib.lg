@@ -107,16 +107,24 @@
   (loop [flags {} [x value & more :as xs] (split-short-flags args)]
     (if (empty? xs)
       [flags xs]
-      (let [entry (get spec x)]
+      (let [eq-idx (when (and (string? x)
+                              (str/starts-with? x "--"))
+                     (str/index-of x "="))
+            inline-flag (when eq-idx (subs x 0 eq-idx))
+            inline-value (when eq-idx (subs x (+ eq-idx 1)))
+            entry (or (get spec x)
+                      (when inline-flag (get spec inline-flag)))]
         (if-let [[k kind] entry]
-          (cond
-            (= kind :bool)       (recur (assoc flags k true) (rest xs))
-            (= kind :ignore)     (recur flags (rest xs))
-            (= kind :value)      (recur (assoc flags k value) more)
-            (= kind :int)        (recur (assoc flags k (parse-int value)) more)
-            (= kind :accumulate) (recur (update flags k (fn [v] (conj (or v []) value)))
-                                        more)
-              :else                (recur flags (rest xs)))
+          (let [arg  (or inline-value value)
+                tail (if inline-value (rest xs) more)]
+            (cond
+              (= kind :bool)       (recur (assoc flags k true) (rest xs))
+              (= kind :ignore)     (recur flags (rest xs))
+              (= kind :value)      (recur (assoc flags k arg) tail)
+              (= kind :int)        (recur (assoc flags k (parse-int arg)) tail)
+              (= kind :accumulate) (recur (update flags k (fn [v] (conj (or v []) arg)))
+                                          tail)
+              :else                (recur flags (rest xs))))
           [flags xs])))))
 
 ;; ---------------------------------------------------------------------------
@@ -243,6 +251,19 @@
   (reduce (fn [acc spec] (conj acc (parse-tmpfs-spec spec on-err)))
           []
           (or specs [])))
+
+;; ---------------------------------------------------------------------------
+;; network parsing
+;; ---------------------------------------------------------------------------
+
+(defn parse-network-spec
+  "Parse --net/--network. Runtime network drivers dispatch on keyword :type."
+  [spec on-err]
+  (let [spec (or spec "host")]
+    (cond
+      (= spec "host") {:type :host}
+      (= spec "none") {:type :none}
+      :else (on-err (str "unsupported network: " spec)))))
 
 ;; ---------------------------------------------------------------------------
 ;; env helpers

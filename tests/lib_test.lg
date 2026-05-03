@@ -241,6 +241,17 @@
          (lib/parse-tmpfs-specs ["/cache" "/run/app:mode=0755"] throw-err))))
 
 ;; ---------------------------------------------------------------------------
+;; network parsing
+;; ---------------------------------------------------------------------------
+
+(deftest parse-network-spec-defaults-to-host
+  (is (= {:type :host} (lib/parse-network-spec nil throw-err))))
+
+(deftest parse-network-spec-known-drivers
+  (is (= {:type :host} (lib/parse-network-spec "host" throw-err)))
+  (is (= {:type :none} (lib/parse-network-spec "none" throw-err))))
+
+;; ---------------------------------------------------------------------------
 ;; parse-signal
 ;; ---------------------------------------------------------------------------
 
@@ -372,6 +383,16 @@
 (deftest parse-flags-value
   (is (= [{:signal "TERM"} ["abc"]]
          (lib/parse-flags {"-s" [:signal :value]} ["-s" "TERM" "abc"]))))
+
+(deftest parse-flags-long-inline-value
+  (is (= [{:network "none"} ["alpine"]]
+         (lib/parse-flags {"--net" [:network :value]}
+                          ["--net=none" "alpine"]))))
+
+(deftest parse-flags-long-inline-accumulate
+  (is (= [{:tmpfs ["/cache" "/run:mode=0755"]} ["alpine"]]
+         (lib/parse-flags {"--tmpfs" [:tmpfs :accumulate]}
+                          ["--tmpfs=/cache" "--tmpfs=/run:mode=0755" "alpine"]))))
 
 (deftest parse-flags-int
   (is (= [{:grace 30} ["abc"]]

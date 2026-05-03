@@ -1,0 +1,46 @@
+(ns net
+  (:require [syscall :as sys]))
+
+(def DEFAULT-NETWORK {:type :host})
+
+(defn normalize
+  "Return a network map with a keyword :type. JSON round-trips keyword values
+   as strings, so runtime callers normalize before multimethod dispatch."
+  [network]
+  (let [network (or network DEFAULT-NETWORK)
+        t       (:type network)]
+    (assoc network :type (cond
+                           (nil? t) :host
+                           (keyword? t) t
+                           :else (keyword t)))))
+
+(defmulti cloneflags (fn [network] (:type (normalize network))))
+(defmulti setup (fn [container-id network state] (:type (normalize network))))
+(defmulti cleanup (fn [container-id network state] (:type (normalize network))))
+
+(defmethod cloneflags :host [_]
+  0)
+
+(defmethod cloneflags :none [_]
+  sys/CLONE_NEWNET)
+
+(defmethod cloneflags :default [network]
+  (throw (str "unsupported network type: " (:type (normalize network)))))
+
+(defmethod setup :host [_id _network _state]
+  nil)
+
+(defmethod setup :none [_id _network _state]
+  nil)
+
+(defmethod setup :default [_id network _state]
+  (throw (str "unsupported network type: " (:type (normalize network)))))
+
+(defmethod cleanup :host [_id _network _state]
+  nil)
+
+(defmethod cleanup :none [_id _network _state]
+  nil)
+
+(defmethod cleanup :default [_id network _state]
+  (throw (str "unsupported network type: " (:type (normalize network)))))

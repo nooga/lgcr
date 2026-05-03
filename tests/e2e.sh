@@ -207,6 +207,32 @@ section "run --hostname sets container hostname"
 OUT=$("$LGCR" run --hostname lgcr-test-host "$IMG" hostname 2>&1)
 expect_contains "$OUT" "lgcr-test-host" "hostname applied"
 
+section "run --net host keeps default network namespace"
+OUT=$("$LGCR" run "$IMG" readlink /proc/self/ns/net 2>&1)
+DEFAULT_NETNS=$(echo "$OUT" | grep -E 'net:\[[0-9]+\]' | tail -1)
+OUT=$("$LGCR" run --net=host "$IMG" readlink /proc/self/ns/net 2>&1)
+HOST_NETNS=$(echo "$OUT" | grep -E 'net:\[[0-9]+\]' | tail -1)
+expect_eq "$HOST_NETNS" "$DEFAULT_NETNS" "host network matches default"
+
+section "run --network none creates a separate network namespace"
+OUT=$("$LGCR" run --network none "$IMG" readlink /proc/self/ns/net 2>&1)
+NONE_NETNS=$(echo "$OUT" | grep -E 'net:\[[0-9]+\]' | tail -1)
+if [ "$NONE_NETNS" != "$DEFAULT_NETNS" ] && [ -n "$NONE_NETNS" ]; then
+    PASS=$((PASS + 1))
+    echo "  ok  none network namespace differs"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL [${CURRENT}] none network namespace did not differ: default=$DEFAULT_NETNS none=$NONE_NETNS"
+fi
+
+section "run --net rejects unsupported network drivers"
+set +e
+OUT=$("$LGCR" run --net=bridge "$IMG" true 2>&1)
+RC=$?
+set -e
+expect_eq "$RC" "1" "invalid network rc"
+expect_contains "$OUT" "unsupported network: bridge" "invalid network error"
+
 section "bind mount -v exposes host directory read-write"
 BIND_DIR="$(pwd)/.tmp-lgcr-bind-$$"
 rm -rf "$BIND_DIR"
