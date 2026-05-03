@@ -24,6 +24,7 @@ New pure helpers go in `lib.lg` so they're testable in isolation —
 - `pull`: real OCI registry client (manifest list resolution, token auth, streaming layer download)
 - `run`: overlay rootfs + namespaces (mnt/pid/uts/ipc) + cgroups v2 limits
 - `run -v` / `--mount`: host bind mounts, including read-only remounts
+- `run --read-only`: read-only rootfs with writable `/tmp` and `/run` tmpfs mounts
 - Namespace re-exec via `syscall/spawn-async` with cloneflags (no `unshare(1)` dependency)
 - Cross-OS bundle from macOS host → single static Linux binary
 
@@ -132,7 +133,8 @@ all exit paths), sends the slave ×3 as the primary's stdio with
 runs the same stdin→master / master→stdout / SIGWINCH forwarders as
 `exec -it`.
 
-Not yet: `exec --user`.
+`exec --user USER[:GROUP]` is now wired through the same per-request
+credential path as primary commands.
 
 ## M4 — security & isolation
 
@@ -150,8 +152,8 @@ of the defense-in-depth layers is a namespace trick, not isolation.
   `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ...)`. Needs a BPF program
   representation; simplest is a fixed compiled default + user-supplied JSON
   profile later.
-- **Read-only rootfs**: `--read-only` flag; mount merged rootfs MS_RDONLY plus
-  a tmpfs for `/tmp`. Helps both security and immutability semantics.
+- **Read-only rootfs — done**: `--read-only` flag; remounts the merged rootfs
+  MS_RDONLY plus tmpfs mounts for `/tmp` and `/run`.
 - **Rootless mode**: user namespaces with uid_map/gid_map. Lets non-root users
   run containers. Requires significant work: subuid/subgid parsing, userns
   cloneflag, newuidmap/newgidmap helpers (or direct `/proc/.../uid_map` writes).

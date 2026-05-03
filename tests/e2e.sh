@@ -203,11 +203,20 @@ section "env override: -e FOO=bar arrives inside container"
 OUT=$("$LGCR" run -e "FOO=bar" "$IMG" sh -c "echo FOO=\$FOO")
 expect_contains "$OUT" "FOO=bar"
 
+section "run --hostname sets container hostname"
+OUT=$("$LGCR" run --hostname lgcr-test-host "$IMG" hostname 2>&1)
+expect_contains "$OUT" "lgcr-test-host" "hostname applied"
+
 section "bind mount -v exposes host directory read-write"
 BIND_DIR="$(pwd)/.tmp-lgcr-bind-$$"
 rm -rf "$BIND_DIR"
 mkdir -p "$BIND_DIR"
 printf "host-input\n" > "$BIND_DIR/input.txt"
+
+section "run -w sets working directory"
+OUT=$("$LGCR" run -v "$BIND_DIR:/work" -w /work "$IMG" pwd 2>&1)
+expect_contains "$OUT" "/work" "workdir override applied"
+
 OUT=$("$LGCR" run -v "$BIND_DIR:/mnt/host" "$IMG" sh -c "cat /mnt/host/input.txt; echo container-output > /mnt/host/output.txt" 2>&1)
 expect_contains "$OUT" "host-input" "container read host file"
 expect_eq "$(cat "$BIND_DIR/output.txt")" "container-output" "container wrote host file"
@@ -236,6 +245,18 @@ expect_contains "$OUT" "host-input" "exec read bind mount"
 "$LGCR" exec "${MNTID:0:6}" sh -c "echo exec-output > /mnt/host/exec.txt" > /dev/null
 expect_eq "$(cat "$BIND_DIR/exec.txt")" "exec-output" "exec wrote through bind mount"
 "$LGCR" rm -f "${MNTID:0:6}" > /dev/null
+
+section "--read-only makes rootfs immutable but keeps tmpfs writable"
+OUT=$("$LGCR" run --read-only "$IMG" sh -c "if sh -c 'echo nope > /root-blocked' 2>/dev/null; then echo ROOT_WRITE_OK; else echo ROOT_WRITE_FAIL; fi; echo tmp-ok > /tmp/t; cat /tmp/t; echo run-ok > /run/r; cat /run/r" 2>&1)
+expect_contains "$OUT" "ROOT_WRITE_FAIL" "rootfs write rejected"
+expect_contains "$OUT" "tmp-ok" "/tmp tmpfs writable"
+expect_contains "$OUT" "run-ok" "/run tmpfs writable"
+
+section "--read-only still allows writable bind mounts"
+OUT=$("$LGCR" run --read-only -v "$BIND_DIR:/mnt/host" "$IMG" sh -c "echo ro-root-bind > /mnt/host/readonly-root-bind.txt; cat /mnt/host/readonly-root-bind.txt" 2>&1)
+expect_contains "$OUT" "ro-root-bind" "bind mount writable under read-only rootfs"
+expect_eq "$(cat "$BIND_DIR/readonly-root-bind.txt")" "ro-root-bind" "host saw read-only-root bind write"
+
 rm -rf "$BIND_DIR"
 
 section "exec runs a command inside a running container"
@@ -261,6 +282,11 @@ expect_eq "$EC" "143" "TERM = 128+15"
 section "exec -e sets env inside the container"
 OUT=$("$LGCR" exec -e FOO=exec-me "${EXID:0:6}" env 2>&1)
 expect_contains "$OUT" "FOO=exec-me" "custom env"
+
+section "exec --user runs as requested uid/gid"
+OUT=$("$LGCR" exec --user 65534:65534 "${EXID:0:6}" sh -c 'echo uid=$(id -u) gid=$(id -g)' 2>&1)
+expect_contains "$OUT" "uid=65534" "exec uid"
+expect_contains "$OUT" "gid=65534" "exec gid"
 
 section "exec shares mount ns — can see primary's fs effects"
 "$LGCR" exec "${EXID:0:6}" /bin/sh -c "echo marker > /tmp/from-exec" > /dev/null 2>&1

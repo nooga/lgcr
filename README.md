@@ -56,8 +56,8 @@ lgcr logs -f "$cid"
 | `lgcr pull <image>` | Fetch an OCI image (Docker Hub or any v2 registry) |
 | `lgcr images [-q]` | List pulled images (name, size, age); `-q` just refs |
 | `lgcr rmi [-f] <image>...` | Remove an image; refuses if a container uses it unless `-f` |
-| `lgcr run [-d\|-it] [--rm] [-e K=V] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image\|rootfs> [cmd [args...]]` | Run a container; auto-pulls if the image is missing; supports bind mounts; `-d` detach, `-it` interactive pty |
-| `lgcr exec [-it] [-e K=V] <id> <cmd> [args...]` | Run a command inside a running container; `-it` for a pty |
+| `lgcr run [-d\|-it] [--rm] [--read-only] [-e K=V] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image\|rootfs> [cmd [args...]]` | Run a container; auto-pulls if the image is missing; supports read-only rootfs and bind mounts; `-d` detach, `-it` interactive pty |
+| `lgcr exec [-it] [-e K=V] [-u USER[:GROUP]] <id> <cmd> [args...]` | Run a command inside a running container; `-it` for a pty; `-u` changes uid/gid |
 | `lgcr ps [-a] [-q]` | List containers; `-a` includes exited, `-q` just ids |
 | `lgcr logs [-f] <id>` | Dump or tail captured stdout/stderr |
 | `lgcr stop [-t SECS] <id>...` | SIGTERM, grace, SIGKILL |
@@ -79,10 +79,17 @@ lgcr run -d --rm alpine:3.21 sh -c 'echo done > /tmp/marker; sleep 5'
 lgcr run -e RUST_LOG=debug -e PORT=8080 alpine:3.21 env
 
 # Bind-mount a host directory into the container
-lgcr run -v "$PWD:/work" alpine:3.21 ls /work
+lgcr run -v "$PWD:/work" -w /work alpine:3.21 ls
 
 # Read-only bind mounts work with either -v or --mount
 lgcr run --mount type=bind,src="$PWD/config",dst=/config,ro alpine:3.21 cat /config/app.conf
+
+# Make the image rootfs read-only while keeping /tmp and /run writable
+lgcr run --read-only alpine:3.21 sh -c 'echo ok > /tmp/probe'
+
+# Override hostname, or run an exec as a different user
+lgcr run --hostname worker-1 alpine:3.21 hostname
+lgcr exec -u 65534:65534 "$cid" id
 
 # Stop with a custom grace period
 lgcr stop -t 30 abc123
