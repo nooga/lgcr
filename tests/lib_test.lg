@@ -2,8 +2,8 @@
 ;; Run with: letgo tests/lib_test.lg  (from project root)
 
 (ns lgcr.lib-test
-  (:require [lib]
-            [test :refer [deftest is testing run-tests]]))
+  (:require [lib :as lib]
+            [test :as test :refer [deftest is testing run-tests]]))
 
 ;; ---------------------------------------------------------------------------
 ;; pad-right
@@ -56,6 +56,16 @@
   (is (= ["arg" "-d"]            (lib/split-short-flags ["arg" "-d"])))
   (is (= ["-a" "--rm" "-d" "-f"] (lib/split-short-flags ["-a" "--rm" "-df"])))
   (is (= [] (lib/split-short-flags []))))
+
+;; ---------------------------------------------------------------------------
+;; path helpers
+;; ---------------------------------------------------------------------------
+
+(deftest path-dirname-various
+  (is (= "/" (lib/path-dirname "/work")))
+  (is (= "/work" (lib/path-dirname "/work/file.txt")))
+  (is (= "/work/nested" (lib/path-dirname "/work/nested/file.txt")))
+  (is (= "." (lib/path-dirname "file.txt"))))
 
 ;; ---------------------------------------------------------------------------
 ;; env-has-key? / merge-env
@@ -169,6 +179,38 @@
     (is (= [] a) "nil entrypoint stripped cleanly")))
 
 ;; ---------------------------------------------------------------------------
+;; bind mount parsing
+;; ---------------------------------------------------------------------------
+
+(deftest parse-volume-mount-rw
+  (is (= {:type "bind" :src "/host" :dst "/work" :readonly? false}
+         (lib/parse-mount-spec "/host:/work" throw-err))))
+
+(deftest parse-volume-mount-ro
+  (is (= {:type "bind" :src "/host/file" :dst "/etc/file" :readonly? true}
+         (lib/parse-mount-spec "/host/file:/etc/file:ro" throw-err))))
+
+(deftest parse-long-mount-rw
+  (is (= {:type "bind" :src "/host" :dst "/work" :readonly? false}
+         (lib/parse-mount-spec "type=bind,src=/host,dst=/work" throw-err))))
+
+(deftest parse-long-mount-readonly
+  (is (= {:type "bind" :src "/host" :dst "/work" :readonly? true}
+         (lib/parse-mount-spec "type=bind,source=/host,target=/work,readonly" throw-err))))
+
+(deftest parse-mount-specs-accumulates
+  (is (= [{:type "bind" :src "/a" :dst "/x" :readonly? false}
+          {:type "bind" :src "/b" :dst "/y" :readonly? true}]
+         (lib/parse-mount-specs ["/a:/x" "/b:/y:ro"] throw-err))))
+
+(deftest valid-mount-dst-rejects-unsafe
+  (is (= true  (lib/valid-mount-dst? "/work")))
+  (is (= true  (lib/valid-mount-dst? "/work/nested")))
+  (is (= false (lib/valid-mount-dst? "/")))
+  (is (= false (lib/valid-mount-dst? "work")))
+  (is (= false (lib/valid-mount-dst? "/work/../host"))))
+
+;; ---------------------------------------------------------------------------
 ;; parse-signal
 ;; ---------------------------------------------------------------------------
 
@@ -188,6 +230,11 @@
 ;; ---------------------------------------------------------------------------
 ;; humanize-ago
 ;; ---------------------------------------------------------------------------
+
+(deftest format-tenths-drops-zero-fraction
+  (is (= "1" (lib/format-tenths 10)))
+  (is (= "3.1" (lib/format-tenths 31)))
+  (is (= "0.7" (lib/format-tenths 7))))
 
 (deftest humanize-bytes-various
   (is (= "?"      (lib/humanize-bytes nil)))
@@ -248,6 +295,78 @@
 (deftest render-status-created
   (is (= "Created"
          (lib/render-status {:effective-status "created"} 100))))
+
+;; ---------------------------------------------------------------------------
+;; parse-flags
+;; ---------------------------------------------------------------------------
+
+(def RUN-SPEC
+  {"-d"   [:detached?  :bool]
+   "--rm" [:rm?        :bool]
+   "-t"   [:tty?       :bool]
+   "-i"   [:_i         :ignore]
+   "-e"   [:extra-env  :accumulate]})
+
+(deftest parse-flags-empty
+  (is (= [{} []] (lib/parse-flags RUN-SPEC []))))
+
+(deftest parse-flags-single-bool
+  (is (= [{:detached? true} []] (lib/parse-flags RUN-SPEC ["-d"]))))
+
+(deftest parse-flags-multiple-bool
+  (is (= [{:detached? true :rm? true} []]
+         (lib/parse-flags RUN-SPEC ["-d" "--rm"]))))
+
+(deftest parse-flags-stops-at-positional
+  (is (= [{:detached? true} ["alpine" "/bin/sh"]]
+         (lib/parse-flags RUN-SPEC ["-d" "alpine" "/bin/sh"]))))
+
+(deftest parse-flags-stops-at-unknown
+  (is (= [{:detached? true} ["--unknown" "x"]]
+         (lib/parse-flags RUN-SPEC ["-d" "--unknown" "x"]))))
+
+(deftest parse-flags-ignore-consumed-not-stored
+  (let [[f xs] (lib/parse-flags RUN-SPEC ["-i" "-t" "rest"])]
+    (is (= {:tty? true} f))
+    (is (= ["rest"] xs))))
+
+(deftest parse-flags-combined-short
+  ;; -it splits to -i (ignore) + -t (bool)
+  (is (= [{:tty? true} ["alpine"]]
+         (lib/parse-flags RUN-SPEC ["-it" "alpine"]))))
+
+(deftest parse-flags-accumulate
+  (is (= [{:extra-env ["A=1" "B=2"]} ["alpine"]]
+         (lib/parse-flags RUN-SPEC ["-e" "A=1" "-e" "B=2" "alpine"]))))
+
+(deftest parse-flags-value
+  (is (= [{:signal "TERM"} ["abc"]]
+         (lib/parse-flags {"-s" [:signal :value]} ["-s" "TERM" "abc"]))))
+
+(deftest parse-flags-int
+  (is (= [{:grace 30} ["abc"]]
+         (lib/parse-flags {"-t" [:grace :int]} ["-t" "30" "abc"]))))
+
+(deftest parse-flags-long-flag
+  (is (= [{:containers? true :images? true} []]
+         (lib/parse-flags {"--containers" [:containers? :bool]
+                           "--images"     [:images? :bool]}
+                          ["--containers" "--images"]))))
+
+(deftest parse-flags-mixed-kinds
+  (is (= [{:detached? true :rm? true :extra-env ["X=1"] :tty? true}
+          ["img" "cmd" "arg"]]
+         (lib/parse-flags RUN-SPEC
+                          ["-d" "--rm" "-e" "X=1" "-it" "img" "cmd" "arg"]))))
+
+(deftest parse-flags-no-flags-just-positional
+  (is (= [{} ["alpine" "sh"]]
+         (lib/parse-flags RUN-SPEC ["alpine" "sh"]))))
+
+(deftest parse-flags-flag-after-positional-stays-positional
+  ;; once we hit a non-flag, the rest is positional even if it looks like a flag
+  (is (= [{} ["cmd" "-d"]]
+         (lib/parse-flags RUN-SPEC ["cmd" "-d"]))))
 
 ;; ---------------------------------------------------------------------------
 ;; main

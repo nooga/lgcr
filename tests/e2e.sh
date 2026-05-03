@@ -203,6 +203,41 @@ section "env override: -e FOO=bar arrives inside container"
 OUT=$("$LGCR" run -e "FOO=bar" "$IMG" sh -c "echo FOO=\$FOO")
 expect_contains "$OUT" "FOO=bar"
 
+section "bind mount -v exposes host directory read-write"
+BIND_DIR="$(pwd)/.tmp-lgcr-bind-$$"
+rm -rf "$BIND_DIR"
+mkdir -p "$BIND_DIR"
+printf "host-input\n" > "$BIND_DIR/input.txt"
+OUT=$("$LGCR" run -v "$BIND_DIR:/mnt/host" "$IMG" sh -c "cat /mnt/host/input.txt; echo container-output > /mnt/host/output.txt" 2>&1)
+expect_contains "$OUT" "host-input" "container read host file"
+expect_eq "$(cat "$BIND_DIR/output.txt")" "container-output" "container wrote host file"
+
+section "bind mount -v :ro rejects writes"
+OUT=$("$LGCR" run -v "$BIND_DIR:/mnt/ro:ro" "$IMG" sh -c "cat /mnt/ro/input.txt; if sh -c 'echo nope > /mnt/ro/blocked.txt' 2>/dev/null; then echo WRITE_OK; else echo WRITE_FAIL; fi" 2>&1)
+expect_contains "$OUT" "host-input" "readonly mount readable"
+expect_contains "$OUT" "WRITE_FAIL" "readonly mount blocked write"
+if [ -e "$BIND_DIR/blocked.txt" ]; then
+    FAIL=$((FAIL + 1))
+    echo "  FAIL [${CURRENT}] readonly mount created blocked.txt"
+else
+    PASS=$((PASS + 1))
+    echo "  ok  readonly mount did not create file"
+fi
+
+section "--mount binds a single host file"
+OUT=$("$LGCR" run --mount "type=bind,src=$BIND_DIR/input.txt,dst=/mounted-file,ro" "$IMG" cat /mounted-file 2>&1)
+expect_contains "$OUT" "host-input" "file bind content visible"
+
+section "exec shares bind mount namespace"
+MNTID=$("$LGCR" run -d -v "$BIND_DIR:/mnt/host" "$IMG" sleep 30 2>&1 | tail -1)
+sleep 1
+OUT=$("$LGCR" exec "${MNTID:0:6}" cat /mnt/host/input.txt 2>&1)
+expect_contains "$OUT" "host-input" "exec read bind mount"
+"$LGCR" exec "${MNTID:0:6}" sh -c "echo exec-output > /mnt/host/exec.txt" > /dev/null
+expect_eq "$(cat "$BIND_DIR/exec.txt")" "exec-output" "exec wrote through bind mount"
+"$LGCR" rm -f "${MNTID:0:6}" > /dev/null
+rm -rf "$BIND_DIR"
+
 section "exec runs a command inside a running container"
 EXID=$("$LGCR" run -d "$IMG" sleep 120 2>&1 | tail -1)
 sleep 0.5
@@ -283,6 +318,13 @@ OUT=$("$LGCR" inspect "${CA:0:1}" 2>&1 || true)
 expect_contains "$OUT" "at least 2 characters" "min-prefix enforced"
 "$LGCR" rm -f "${CA:0:6}" "${CB:0:6}" > /dev/null
 
+section "container /etc/resolv.conf comes from the host"
+HOST_RC=$(head -1 /etc/resolv.conf 2>/dev/null || echo "")
+if [ -n "$HOST_RC" ]; then
+    OUT=$("$LGCR" run --rm "$IMG" head -1 /etc/resolv.conf 2>&1)
+    expect_contains "$OUT" "$HOST_RC" "container sees host's first resolv.conf line"
+fi
+
 section "run auto-pulls a missing image"
 # Wipe hello-world from the image store via the tool (works through the
 # darwin shim too, since it forwards into Lima).
@@ -352,7 +394,6 @@ expect_not_contains "$OUT" "hello-world" "hello-world pruned"
 
 section "prune (no flags) wipes both"
 "$LGCR" run "$IMG" sh -c 'true' > /dev/null 2>&1
-"$LGCR" pull hello-world > /dev/null 2>&1
 sleep 1
 OUT=$("$LGCR" prune 2>&1)
 expect_contains "$OUT" "pruned" "default prunes both"

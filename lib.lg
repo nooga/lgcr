@@ -6,7 +6,7 @@
 ;; vars. Everything is string/collection/number manipulation.
 
 (ns lib
-  (:require [string]))
+  (:require [string :as str]))
 
 ;; ---------------------------------------------------------------------------
 ;; constants
@@ -34,7 +34,18 @@
     (if (pos? extra) (str s (apply str (repeat extra " "))) s)))
 
 (defn path-join [& parts]
-  (string/join "/" parts))
+  (str/join "/" parts))
+
+(defn path-dirname
+  "Return the parent directory for an absolute-ish path string."
+  [path]
+  (let [parts (str/split path "/")
+        parent (drop-last parts)]
+    (cond
+      (= path "/") "/"
+      (empty? parent) "."
+      (= [""] parent) "/"
+      :else (str/join "/" parent))))
 
 (defn numeric? [s]
   (and (string? s) (pos? (count s))
@@ -53,8 +64,8 @@
   [args]
   (reduce (fn [acc x]
             (cond
-              (or (not (string/starts-with? x "-"))
-                  (string/starts-with? x "--")
+              (or (not (str/starts-with? x "-"))
+                  (str/starts-with? x "--")
                   (<= (count x) 2))
               (conj acc x)
               :else
@@ -63,6 +74,136 @@
                       (seq (subs x 1)))))
           []
           args))
+
+(defn parse-flags
+  "Parse `args` against `spec`, returning [flags-map remaining-args].
+
+   `spec` maps a flag string (e.g. \"-d\", \"--rm\") to `[k kind]`:
+     :bool       — presence sets `k` to true
+     :value      — next arg is the string value of `k`
+     :int        — next arg parsed as integer
+     :accumulate — next arg appended to a vector under `k`
+     :ignore     — flag consumed but not stored (compatibility shim)
+
+   Stops at the first non-flag or unrecognized flag. Combined short
+   flags (-abc) are split first via `split-short-flags`."
+  [spec args]
+  (loop [flags {} [x value & more :as xs] (split-short-flags args)]
+    (if (empty? xs)
+      [flags xs]
+      (let [entry (get spec x)]
+        (if-let [[k kind] entry]
+          (cond
+            (= kind :bool)       (recur (assoc flags k true) (rest xs))
+            (= kind :ignore)     (recur flags (rest xs))
+            (= kind :value)      (recur (assoc flags k value) more)
+            (= kind :int)        (recur (assoc flags k (parse-int value)) more)
+            (= kind :accumulate) (recur (update flags k (fn [v] (conj (or v []) value)))
+                                        more)
+              :else                (recur flags (rest xs)))
+          [flags xs])))))
+
+;; ---------------------------------------------------------------------------
+;; bind mount parsing
+;; ---------------------------------------------------------------------------
+
+(defn valid-mount-dst?
+  "Container mount destinations must be absolute, not root, and not escape."
+  [dst]
+  (and (string? dst)
+       (str/starts-with? dst "/")
+       (not= "/" dst)
+       (not (some #(= ".." %) (str/split dst "/")))))
+
+(defn ensure-mount
+  [{:keys [src dst] :as mount} on-err]
+  (cond
+    (or (nil? src) (= "" src))
+    (on-err "mount source is required")
+
+    (or (nil? dst) (= "" dst))
+    (on-err "mount destination is required")
+
+    (not (str/starts-with? src "/"))
+    (on-err (str "mount source must be absolute: " src))
+
+    (not (valid-mount-dst? dst))
+    (on-err (str "mount destination must be an absolute container path without '..': " dst))
+
+    :else mount))
+
+(defn parse-volume-mount
+  "Parse Docker-style -v SRC:DST[:ro|rw]."
+  [spec on-err]
+  (let [[src dst mode extra] (str/split spec ":")]
+    (cond
+      extra
+      (on-err (str "invalid -v mount: " spec))
+
+      (and mode (not (= mode "ro")) (not (= mode "rw")))
+      (on-err (str "invalid mount mode: " mode))
+
+      :else
+      (ensure-mount {:type "bind"
+                     :src src
+                     :dst dst
+                     :readonly? (= mode "ro")}
+                    on-err))))
+
+(defn parse-mount-kv
+  [acc token on-err]
+  (cond
+    (or (= token "ro") (= token "readonly"))
+    (assoc acc :readonly? true)
+
+    (str/includes? token "=")
+    (let [[k v] (str/split token "=")]
+      (cond
+        (= k "type")
+        (if (= v "bind")
+          acc
+          (on-err (str "unsupported mount type: " v)))
+
+        (or (= k "src") (= k "source"))
+        (assoc acc :src v)
+
+        (or (= k "dst") (= k "target") (= k "destination"))
+        (assoc acc :dst v)
+
+        (or (= k "ro") (= k "readonly"))
+        (assoc acc :readonly? (not (or (= v "false") (= v "0"))))
+
+        :else
+        (on-err (str "unknown mount option: " k))))
+
+    :else
+    (on-err (str "invalid mount option: " token))))
+
+(defn parse-long-mount
+  "Parse --mount type=bind,src=SRC,dst=DST[,ro]."
+  [spec on-err]
+  (ensure-mount
+    (reduce (fn [acc token] (parse-mount-kv acc token on-err))
+            {:type "bind" :readonly? false}
+            (str/split spec ","))
+    on-err))
+
+(defn parse-mount-spec
+  "Parse either -v SRC:DST[:ro|rw] or --mount type=bind,src=SRC,dst=DST[,ro]."
+  [spec on-err]
+  (if (or (str/includes? spec "type=")
+          (str/includes? spec "src=")
+          (str/includes? spec "source=")
+          (str/includes? spec "dst=")
+          (str/includes? spec "target=")
+          (str/includes? spec "destination="))
+    (parse-long-mount spec on-err)
+    (parse-volume-mount spec on-err)))
+
+(defn parse-mount-specs [specs on-err]
+  (reduce (fn [acc spec] (conj acc (parse-mount-spec spec on-err)))
+          []
+          (or specs [])))
 
 ;; ---------------------------------------------------------------------------
 ;; env helpers
@@ -74,7 +215,7 @@
   (let [prefix (str k "=")]
     (reduce (fn [acc e]
               (or acc
-                  (and (string? e) (string/starts-with? e prefix))))
+                  (and (string? e) (str/starts-with? e prefix))))
             false env)))
 
 (defn merge-env
@@ -86,7 +227,7 @@
         image (clean image)
         user  (clean user)
         combined (reduce (fn [acc e]
-                           (let [k (first (string/split e "="))]
+                           (let [k (first (str/split e "="))]
                              (if (env-has-key? acc k)
                                acc
                                (conj acc e))))
@@ -104,25 +245,24 @@
   "Parse 'library/alpine:3.21' or 'alpine' into {:registry :repo :tag}.
    Docker Hub short names get an implicit 'library/' prefix."
   [ref]
-  (let [parts         (string/split ref "/")
-        has-registry? (and (> (count parts) 1)
-                           (or (string/includes? (first parts) ".")
-                               (string/includes? (first parts) ":")))
-        registry      (if has-registry? (first parts) "registry-1.docker.io")
-        repo-tag      (if has-registry? (string/join "/" (rest parts)) ref)
-        rt-parts      (string/split repo-tag ":")
-        repo          (first rt-parts)
-        tag           (if (> (count rt-parts) 1) (second rt-parts) "latest")
-        repo          (if (and (= registry "registry-1.docker.io")
-                               (not (string/includes? repo "/")))
-                        (str "library/" repo)
-                        repo)]
+  (let [[head & more]   (str/split ref "/")
+        has-registry?   (and (seq more)
+                             (or (str/includes? head ".")
+                                 (str/includes? head ":")))
+        registry        (if has-registry? head "registry-1.docker.io")
+        repo-tag        (if has-registry? (str/join "/" more) ref)
+        [repo tag-part] (str/split repo-tag ":")
+        tag             (or tag-part "latest")
+        repo            (if (and (= registry "registry-1.docker.io")
+                                 (not (str/includes? repo "/")))
+                          (str "library/" repo)
+                          repo)]
     {:registry registry :repo repo :tag tag}))
 
 (defn image-subdir
   "Leaf directory name for an image's rootfs inside the image store."
-  [parsed]
-  (str (string/replace (:repo parsed) "/" "_") "-" (:tag parsed)))
+  [{:keys [repo tag]}]
+  (str (str/replace repo "/" "_") "-" tag))
 
 (defn image-rootfs-dir
   "Full on-disk path for a parsed image ref, given the image store root.
@@ -138,15 +278,16 @@
   "Compose the final argv from image config + user input.
    Returns [command args], or throws if neither side supplied a command."
   [config user-cmd user-args on-err]
-  (let [ep       (strip-nils (:entrypoint config))
-        cfg-cmd  (strip-nils (:cmd config))
-        combined (cond
-                   user-cmd (into ep (into [user-cmd] user-args))
-                   (or (seq ep) (seq cfg-cmd)) (into ep cfg-cmd)
-                   :else nil)]
-    (if (nil? combined)
+  (let [{:keys [entrypoint cmd]} (or config {})
+        ep       (strip-nils entrypoint)
+        cfg-cmd  (strip-nils cmd)
+        [head & more] (cond
+                        user-cmd (into ep (into [user-cmd] user-args))
+                        (or (seq ep) (seq cfg-cmd)) (into ep cfg-cmd)
+                        :else nil)]
+    (if (nil? head)
       (on-err "no command: image has no ENTRYPOINT or CMD and none was given")
-      [(first combined) (vec (rest combined))])))
+      [head (vec more)])))
 
 ;; ---------------------------------------------------------------------------
 ;; signal name → number
@@ -175,15 +316,24 @@
 ;; time formatting
 ;; ---------------------------------------------------------------------------
 
+(defn format-tenths
+  "Render an integer tenths value without a trailing .0."
+  [tenths]
+  (let [whole (int (/ tenths 10))
+        frac  (- tenths (* whole 10))]
+    (if (= 0 frac)
+      (str whole)
+      (str whole "." frac))))
+
 (defn humanize-bytes
   "Format a byte count docker-style: '3.1kB', '12.4MB', '1.2GB'."
   [n]
   (cond
     (nil? n)          "?"
     (< n 1024)        (str n "B")
-    (< n 1048576)     (str (/ (int (/ (* n 10) 1024)) 10.0) "kB")
-    (< n 1073741824)  (str (/ (int (/ (* n 10) 1048576)) 10.0) "MB")
-    :else             (str (/ (int (/ (* n 10) 1073741824)) 10.0) "GB")))
+    (< n 1048576)     (str (format-tenths (int (/ (* n 10) 1024))) "kB")
+    (< n 1073741824)  (str (format-tenths (int (/ (* n 10) 1048576))) "MB")
+    :else             (str (format-tenths (int (/ (* n 10) 1073741824))) "GB")))
 
 (defn humanize-ago
   "Format a duration (seconds) docker-style: '5 seconds', '2 minutes', etc."
@@ -200,32 +350,30 @@
 
 (defn format-cmd
   "Render command + args for display."
-  [state]
-  (let [c (:command state)
-        a (:args state)]
-    (if (seq a)
-      (str c " " (string/join " " a))
-      (str c))))
+  [{:keys [command args]}]
+  (if (seq args)
+    (str command " " (str/join " " args))
+    (str command)))
 
 (defn render-status
   "Docker-style status column for ps, given a state map and current epoch."
-  [state now-e]
-  (let [eff (:effective-status state)
-        dur (fn [t] (when t (humanize-ago (- now-e t))))]
+  [{:keys [effective-status started-epoch finished-epoch exit-code signal pid]}
+   now-e]
+  (let [dur (fn [t] (when t (humanize-ago (- now-e t))))]
     (cond
-      (= "running" eff)
-      (str "Up " (or (dur (:started-epoch state)) "a moment"))
+      (= "running" effective-status)
+      (str "Up " (or (dur started-epoch) "a moment"))
 
-      (= "exited" eff)
-      (str "Exited (" (:exit-code state) ") "
-           (or (dur (:finished-epoch state)) "just now") " ago")
+      (= "exited" effective-status)
+      (str "Exited (" exit-code ") "
+           (or (dur finished-epoch) "just now") " ago")
 
-      (= "killed" eff)
+      (= "killed" effective-status)
       (str "Killed"
-           (when-let [s (:signal state)] (str " (signal " s ")"))
-           " " (or (dur (:finished-epoch state)) "just now") " ago")
+           (when signal (str " (signal " signal ")"))
+           " " (or (dur finished-epoch) "just now") " ago")
 
-      (= "created" eff) "Created"
-      (= "dead" eff)
-      (str "Dead (lost pid " (:pid state) ")")
-      :else eff)))
+      (= "created" effective-status) "Created"
+      (= "dead" effective-status)
+      (str "Dead (lost pid " pid ")")
+      :else effective-status)))

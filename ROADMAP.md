@@ -23,6 +23,7 @@ New pure helpers go in `lib.lg` so they're testable in isolation —
 
 - `pull`: real OCI registry client (manifest list resolution, token auth, streaming layer download)
 - `run`: overlay rootfs + namespaces (mnt/pid/uts/ipc) + cgroups v2 limits
+- `run -v` / `--mount`: host bind mounts, including read-only remounts
 - Namespace re-exec via `syscall/spawn-async` with cloneflags (no `unshare(1)` dependency)
 - Cross-OS bundle from macOS host → single static Linux binary
 

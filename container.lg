@@ -10,12 +10,12 @@
 ;; The "init" command is internal — called by run via the re-exec.
 
 (ns container.runtime
-  (:require [syscall]
-            [unix]
-            [term]
-            [string]
-            [io]
-            [lib]))
+  (:require [syscall :as sys]
+            [unix :as unix]
+            [term :as term]
+            [string :as str]
+            [io :as io]
+            [lib :as lib]))
 
 ;; ---------------------------------------------------------------------------
 ;; helpers
@@ -29,11 +29,15 @@
 (defn sh! [& args]
   (let [result (apply os/sh args)]
     (when (not= 0 (:exit result))
-      (die "command failed: " (string/join " " args) "\n" (:err result)))
+      (die "command failed: " (str/join " " args) "\n" (:err result)))
     result))
 
 (defn exists? [path]
   (not (nil? (os/stat path))))
+
+;; let-go's syscall ns exposes the mount flags lgcr already used, but not
+;; MS_REMOUNT yet. Linux defines it as 32.
+(def MS_REMOUNT 32)
 
 ;; ---------------------------------------------------------------------------
 ;; state store (XDG-rooted, per-container dir)
@@ -71,10 +75,10 @@
 
 (defn now-iso []
   ;; os/sh is cheap enough for this low-frequency path
-  (string/trim (:out (os/sh "date" "-u" "+%Y-%m-%dT%H:%M:%SZ"))))
+  (str/trim (:out (os/sh "date" "-u" "+%Y-%m-%dT%H:%M:%SZ"))))
 
 (defn now-epoch []
-  (parse-int (string/trim (:out (os/sh "date" "+%s")))))
+  (parse-int (str/trim (:out (os/sh "date" "+%s")))))
 
 (defn now-stamp
   "A map of {:iso ... :epoch ...} written alongside state transitions."
@@ -86,7 +90,7 @@
     (if (exists? dir)
       (let [ls (os/sh "ls" "-1" dir)]
         (if (= 0 (:exit ls))
-          (->> (string/split (:out ls) "\n")
+          (->> (str/split (:out ls) "\n")
                (filter #(not= "" %))
                vec)
           []))
@@ -99,23 +103,28 @@
   (when (< (count prefix) 2)
     (die "id prefix must be at least 2 characters"))
   (let [all     (list-container-ids)
-        matches (filter #(string/starts-with? % prefix) all)]
+        matches (filter #(str/starts-with? % prefix) all)]
     (cond
       (= 0 (count matches)) nil
       (= 1 (count matches)) (first matches)
       :else (die "ambiguous id prefix '" prefix "' matches "
                  (count matches) " containers: "
-                 (string/join ", " (reduce (fn [acc x] (conj acc (lib/short-id x))) [] matches))))))
+                 (str/join ", " (mapv lib/short-id matches))))))
+
+(defn require-id
+  "Resolve a container id prefix to a full id, dying with a uniform error
+   message when no container matches."
+  [prefix]
+  (or (resolve-id prefix) (die "no such container: " prefix)))
 
 (defn state-path [id] (str (container-dir id) "/state.json"))
 
 (defn read-state [id]
   (json/read-json (slurp (state-path id)) {:keywords? true}))
 
-(defn write-state [state]
-  (let [id (:id state)]
-    (syscall/mkdir-p (container-dir id) 0755)
-    (spit (state-path id) (json/write-json state))))
+(defn write-state [{:keys [id] :as state}]
+  (sys/mkdir-p (container-dir id) 0755)
+  (spit (state-path id) (json/write-json state)))
 
 (defn update-state [id f & args]
   (let [s (read-state id)
@@ -127,18 +136,17 @@
   ;; signal 0 = existence probe; ESRCH throws, caught as false
   (when pid
     (try
-      (syscall/kill pid 0)
+      (sys/kill pid 0)
       true
       (catch e false))))
 
 (defn effective-status
   "Returns the real status, correcting stale 'running' entries whose pid is
    gone (e.g. the shim itself was killed)."
-  [state]
-  (let [s (:status state)]
-    (if (and (= s "running") (not (pid-alive? (:pid state))))
-      "dead"
-      s)))
+  [{:keys [status pid]}]
+  (if (and (= status "running") (not (pid-alive? pid)))
+    "dead"
+    status))
 
 ;; lib/parse-signal + SIGNAL-NUMBERS live in lib.lg
 
@@ -161,7 +169,7 @@
                  (doseq [d [upper work merged]]
                    (sh! "mkdir" "-p" d))
                  (let [opts (str "lowerdir=" base-rootfs ",upperdir=" upper ",workdir=" work)]
-                   (syscall/mount "overlay" merged "overlay" 0 opts))
+                   (sys/mount "overlay" merged "overlay" 0 opts))
                  (println "[let-go container] using overlay mount")
                  true)
                (catch e
@@ -169,6 +177,18 @@
                  (sh! "mkdir" "-p" merged)
                  (sh! "cp" "-a" (str base-rootfs "/.") merged)
                  false))]
+      ;; Give the container a working resolver. Images ship their builder's
+      ;; /etc/resolv.conf, which usually points at unreachable nameservers.
+      ;; We overwrite with the host's copy — good enough since we share the
+      ;; host network. Fall back to a public resolver if the host has none.
+      (let [etc-dir (lib/path-join merged "etc")
+            target  (lib/path-join etc-dir "resolv.conf")
+            host-rc "/etc/resolv.conf"
+            content (if (exists? host-rc)
+                      (slurp host-rc)
+                      "nameserver 1.1.1.1\nnameserver 8.8.8.8\n")]
+        (sys/mkdir-p etc-dir 0755)
+        (try (spit target content) (catch e nil)))
       {:merged merged :put-old put-old :run-dir run-dir :overlay? ok})))
 
 ;; ---------------------------------------------------------------------------
@@ -184,21 +204,62 @@
     ;; memory limit
     (when-let [mem (:memory limits)]
       (let [bytes (cond
-                    (string/ends-with? mem "g") (str (* (parse-int (subs mem 0 (- (count mem) 1))) 1073741824))
-                    (string/ends-with? mem "m") (str (* (parse-int (subs mem 0 (- (count mem) 1))) 1048576))
-                    (string/ends-with? mem "k") (str (* (parse-int (subs mem 0 (- (count mem) 1))) 1024))
+                    (str/ends-with? mem "g") (str (* (parse-int (subs mem 0 (- (count mem) 1))) 1073741824))
+                    (str/ends-with? mem "m") (str (* (parse-int (subs mem 0 (- (count mem) 1))) 1048576))
+                    (str/ends-with? mem "k") (str (* (parse-int (subs mem 0 (- (count mem) 1))) 1024))
                     :else mem)]
-        (syscall/write-file (lib/path-join cg-path "memory.max") bytes 0644)))
+        (sys/write-file (lib/path-join cg-path "memory.max") bytes 0644)))
     ;; cpu limit (microseconds quota per period)
     (when-let [cpu (:cpu limits)]
-      (syscall/write-file (lib/path-join cg-path "cpu.max") cpu 0644))
+      (sys/write-file (lib/path-join cg-path "cpu.max") cpu 0644))
     ;; pids limit
     (when-let [pids (:pids limits)]
-      (syscall/write-file (lib/path-join cg-path "pids.max") pids 0644))
+      (sys/write-file (lib/path-join cg-path "pids.max") pids 0644))
     cg-path))
 
 (defn cgroup-add-pid [cg-path pid]
-  (syscall/write-file (lib/path-join cg-path "cgroup.procs") (str pid) 0644))
+  (sys/write-file (lib/path-join cg-path "cgroup.procs") (str pid) 0644))
+
+;; ---------------------------------------------------------------------------
+;; bind mounts
+;; ---------------------------------------------------------------------------
+
+(defn validate-mount-sources [mounts]
+  (doseq [{:keys [src]} (lib/strip-nils mounts)]
+    (when-not (exists? src)
+      (die "mount source does not exist: " src))))
+
+(defn mount-target-path [merged dst]
+  (lib/path-join merged (subs dst 1)))
+
+(defn prepare-mount-target [{:keys [src dst]} merged]
+  (let [st     (os/stat src)
+        target (mount-target-path merged dst)]
+    (if (:dir? st)
+      (sys/mkdir-p target 0755)
+      (do
+        (sys/mkdir-p (lib/path-dirname target) 0755)
+        (spit target "")))
+    target))
+
+(defn apply-bind-mounts [merged mounts]
+  (doseq [{:keys [src readonly?] :as mount} (lib/strip-nils mounts)]
+    (let [target (prepare-mount-target mount merged)]
+      (sys/mount src target "none" sys/MS_BIND "")
+      (when readonly?
+        (sys/mount src target "none"
+                   (bit-or sys/MS_BIND
+                           (bit-or MS_REMOUNT sys/MS_RDONLY))
+                   "")))))
+
+(defn unmount-bind-mounts [merged mounts]
+  (let [reversed (reduce (fn [acc mount] (cons mount acc))
+                         []
+                         (lib/strip-nils mounts))]
+    (doseq [{:keys [dst]} reversed]
+      (try
+        (sys/umount (mount-target-path merged dst) 2) ;; MNT_DETACH
+        (catch e nil)))))
 
 ;; ---------------------------------------------------------------------------
 ;; container init (runs inside namespaces)
@@ -210,29 +271,26 @@
   "Find entry for username in /etc/passwd. Returns {:uid N :gid N} or nil."
   [name]
   (try
-    (let [lines (string/split (slurp "/etc/passwd") "\n")]
-      (reduce (fn [acc l]
-                (if acc acc
-                    (let [parts (string/split l ":")]
-                      (if (and (>= (count parts) 4) (= name (first parts)))
-                        {:uid (parse-int (nth parts 2))
-                         :gid (parse-int (nth parts 3))}
-                        nil))))
-              nil lines))
+    (reduce (fn [acc l]
+              (if acc acc
+                  (let [[u _ uid gid & _] (str/split l ":")]
+                    (when (and uid gid (= name u))
+                      {:uid (parse-int uid) :gid (parse-int gid)}))))
+            nil
+            (str/split (slurp "/etc/passwd") "\n"))
     (catch e nil)))
 
 (defn lookup-group
   "Find gid for group name in /etc/group, or nil."
   [name]
   (try
-    (let [lines (string/split (slurp "/etc/group") "\n")]
-      (reduce (fn [acc l]
-                (if acc acc
-                    (let [parts (string/split l ":")]
-                      (if (and (>= (count parts) 3) (= name (first parts)))
-                        (parse-int (nth parts 2))
-                        nil))))
-              nil lines))
+    (reduce (fn [acc l]
+              (if acc acc
+                  (let [[g _ gid & _] (str/split l ":")]
+                    (when (and gid (= name g))
+                      (parse-int gid)))))
+            nil
+            (str/split (slurp "/etc/group") "\n"))
     (catch e nil)))
 
 (defn resolve-user
@@ -240,7 +298,7 @@
    {:uid N :gid N} using /etc/passwd and /etc/group as needed. Empty/nil → nil."
   [spec]
   (when (and spec (not= "" spec))
-    (let [[u g] (string/split spec ":")
+    (let [[u g] (str/split spec ":")
           user-info (cond
                       (lib/numeric? u) {:uid (parse-int u) :gid (parse-int u)}
                       :else (or (lookup-passwd u)
@@ -256,7 +314,7 @@
   "Find an executable: absolute path, or scan a few common dirs."
   [cmd]
   (cond
-    (string/starts-with? cmd "/") cmd
+    (str/starts-with? cmd "/") cmd
     (exists? (str "/bin/" cmd))       (str "/bin/" cmd)
     (exists? (str "/usr/bin/" cmd))   (str "/usr/bin/" cmd)
     (exists? (str "/sbin/" cmd))      (str "/sbin/" cmd)
@@ -277,45 +335,38 @@
    target and signals primary-exit-ch when it exits."
   [conn state-ch]
   (try
-    (let [msg      (unix/recv conn 32768 3)
-          req      (json/read-json (:data msg) {:keywords? true})
-          fds      (:fds msg)
-          stdin    (nth fds 0 nil)
-          stdout   (nth fds 1 nil)
-          stderr   (nth fds 2 nil)]
-      (let [argv     (vec (:argv req))
-            env      (vec (or (:env req) []))
-            tty?     (:tty req)
-            workdir  (:workdir req)
-            user-spec (:user req)
-            primary? (:primary req)
-            bin      (resolve-bin (first argv))
-            creds    (resolve-user user-spec)
-            opts-0   (if tty? {:setctty? true} {})
-            opts-1   (if creds
-                       (assoc opts-0 :uid (:uid creds) :gid (:gid creds))
-                       opts-0)
-            opts     (if (and workdir (not= "" workdir))
-                       (assoc opts-1 :dir workdir)
-                       opts-1)
-            res      (syscall/spawn-async bin argv env 0 stdin stdout stderr
-                                          (if (empty? opts) nil opts))
-            pid      (:pid res)
-            wait-ch  (async/chan 1)]
-        (when primary? (reset! primary-pid pid))
-        ;; Parent closes its dup'd copies; the child has its own fds now.
-        (when stdin  (try (unix/close stdin)  (catch e nil)))
-        (when stdout (try (unix/close stdout) (catch e nil)))
-        (when stderr (try (unix/close stderr) (catch e nil)))
-        ;; Register before the child can possibly be reaped and forgotten.
-        ;; state-mgr handles the race where SIGCHLD lands first.
-        (async/>! state-ch {:op :register :pid pid :ch wait-ch})
-        (unix/send conn (json/write-json {:pid pid}))
-        (let [wr (async/<! wait-ch)]
-          (unix/send conn (json/write-json {:exit   (or (:status wr) 0)
-                                            :signal (or (:signal wr) 0)}))
-          (when primary?
-            (when-let [p @primary-exit-ch] (async/>! p wr))))))
+    (let [msg     (unix/recv conn 32768 3)
+          req     (json/read-json (:data msg) {:keywords? true})
+          {:keys [argv env tty workdir user primary]} req
+          fds     (:fds msg)
+          stdin   (nth fds 0 nil)
+          stdout  (nth fds 1 nil)
+          stderr  (nth fds 2 nil)
+          argv    (vec argv)
+          bin     (resolve-bin (first argv))
+          creds   (resolve-user user)
+          opts    (cond-> {}
+                    tty                             (assoc :setctty? true)
+                    creds                           (assoc :uid (:uid creds)
+                                                           :gid (:gid creds))
+                    (and workdir (not= "" workdir)) (assoc :dir workdir))
+          {:keys [pid]} (sys/spawn-async bin argv (vec (or env [])) 0
+                                             stdin stdout stderr
+                                             (if (empty? opts) nil opts))
+          wait-ch (async/chan 1)]
+      (when primary (reset! primary-pid pid))
+      ;; Parent closes its dup'd copies; the child has its own fds now.
+      (when stdin  (try (unix/close stdin)  (catch e nil)))
+      (when stdout (try (unix/close stdout) (catch e nil)))
+      (when stderr (try (unix/close stderr) (catch e nil)))
+      ;; Register before the child can possibly be reaped and forgotten.
+      ;; state-mgr handles the race where SIGCHLD lands first.
+      (async/>! state-ch {:op :register :pid pid :ch wait-ch})
+      (unix/send conn (json/write-json {:pid pid}))
+      (let [{:keys [status signal] :as wr} (async/<! wait-ch)]
+        (unix/send conn (json/write-json {:exit (or status 0) :signal (or signal 0)}))
+        (when primary
+          (when-let [p @primary-exit-ch] (async/>! p wr)))))
     (catch e
       (try (unix/send conn (json/write-json {:error (str e)})) (catch e2 nil))))
   (try (unix/close conn) (catch e nil)))
@@ -325,39 +376,39 @@
    opens the control socket, and blocks until a :primary client request
    arrives + that child exits. All user-command spawning goes through
    handle-exec-conn; init itself never runs anything from state.json."
-  [state]
-  (let [merged    (:rootfs-merged state)
+  [{:keys [id hostname rootfs-merged mounts]}]
+  (let [merged    rootfs-merged
         put-old   (lib/path-join merged ".pivot_old")
-        hostname  (:hostname state)
-        sock-path (str (container-dir (:id state)) "/ctrl.sock")
+        sock-path (str (container-dir id) "/ctrl.sock")
         ;; Control socket — created BEFORE pivot_root so the socket file lives
         ;; on the host mnt, visible to lgcr clients. The listener fd survives
         ;; the mnt-ns switch; accept() works post-pivot.
         listener  (unix/listen sock-path)]
 
     ;; make our mount tree private so changes don't propagate to host
-    (syscall/mount "none" "/" "none" (bit-or syscall/MS_REC syscall/MS_PRIVATE) "")
+    (sys/mount "none" "/" "none" (bit-or sys/MS_REC sys/MS_PRIVATE) "")
     ;; bind-mount merged onto itself so it becomes a mount point (pivot_root needs this)
-    (syscall/mount merged merged "none" syscall/MS_BIND "")
+    (sys/mount merged merged "none" sys/MS_BIND "")
     ;; mount essential filesystems inside the new root
     (let [proc-dir (lib/path-join merged "proc")
           sys-dir  (lib/path-join merged "sys")
           dev-dir  (lib/path-join merged "dev")]
       (sh! "mkdir" "-p" proc-dir sys-dir dev-dir)
-      (syscall/mount "proc" proc-dir "proc" 0 "")
-      (syscall/mount "sysfs" sys-dir "sysfs" (bit-or syscall/MS_NOSUID
-                                                     (bit-or syscall/MS_NOEXEC
-                                                             syscall/MS_NODEV)) "")
-      (syscall/mount "/dev" dev-dir "none" (bit-or syscall/MS_BIND syscall/MS_REC) ""))
+      (sys/mount "proc" proc-dir "proc" 0 "")
+      (sys/mount "sysfs" sys-dir "sysfs" (bit-or sys/MS_NOSUID
+                                                     (bit-or sys/MS_NOEXEC
+                                                             sys/MS_NODEV)) "")
+      (sys/mount "/dev" dev-dir "none" (bit-or sys/MS_BIND sys/MS_REC) ""))
+    (apply-bind-mounts merged mounts)
     (sh! "mkdir" "-p" put-old)
-    (syscall/pivot-root merged put-old)
-    (syscall/chdir "/")
-    (syscall/umount "/.pivot_old" 2)   ;; MNT_DETACH
-    ;; Use syscall/rm-rf instead of `sh!` — after pivot_root the container's
+    (sys/pivot-root merged put-old)
+    (sys/chdir "/")
+    (sys/umount "/.pivot_old" 2)   ;; MNT_DETACH
+    ;; Use sys/rm-rf instead of `sh!` — after pivot_root the container's
     ;; rootfs may not have /bin/rm (e.g. scratch images like hello-world),
     ;; so exec'ing a shell-out binary here will fail and kill init.
-    (syscall/rm-rf "/.pivot_old")
-    (syscall/sethostname hostname)
+    (sys/rm-rf "/.pivot_old")
+    (sys/sethostname hostname)
 
     (let [;; state-ch routes register/reap events to the state-mgr goroutine.
           ;; state-mgr owns the pid→waiter map + pending-exits buffer; this
@@ -373,50 +424,48 @@
       ;; child could deliver its signal to a disposition we haven't subscribed
       ;; to yet. (Primary / exec children are all spawned by handle-exec-conn
       ;; after this point.)
-      (syscall/signal-notify chld-ch syscall/SIGCHLD)
+      (sys/signal-notify chld-ch sys/SIGCHLD)
 
       ;; state-mgr — serializes all waiter bookkeeping.
       (go
         (loop [waiters {} pending {}]
-          (let [msg (async/<! state-ch)]
+          (let [{:keys [op pid ch wr]} (async/<! state-ch)]
             (cond
-              (= (:op msg) :register)
-              (let [pid (:pid msg) ch (:ch msg)]
-                (if-let [wr (get pending pid)]
-                  (do (async/>! ch wr)
-                      (recur waiters (dissoc pending pid)))
-                  (recur (assoc waiters pid ch) pending)))
+              (= op :register)
+              (if-let [pending-wr (get pending pid)]
+                (do (async/>! ch pending-wr)
+                    (recur waiters (dissoc pending pid)))
+                (recur (assoc waiters pid ch) pending))
 
-              (= (:op msg) :reap)
-              (let [pid (:pid msg) wr (:wr msg)]
-                (if-let [ch (get waiters pid)]
-                  (do (async/>! ch wr)
-                      (recur (dissoc waiters pid) pending))
-                  (recur waiters (assoc pending pid wr))))
+              (= op :reap)
+              (if-let [waiter-ch (get waiters pid)]
+                (do (async/>! waiter-ch wr)
+                    (recur (dissoc waiters pid) pending))
+                (recur waiters (assoc pending pid wr)))
 
               :else (recur waiters pending)))))
 
       ;; signal forwarder — relay terminating signals to whatever the current
       ;; primary pid is (nil until the primary request arrives).
-      (syscall/signal-notify sig-ch
-                             syscall/SIGTERM syscall/SIGINT
-                             syscall/SIGQUIT syscall/SIGHUP)
+      (sys/signal-notify sig-ch
+                         sys/SIGTERM sys/SIGINT
+                         sys/SIGQUIT sys/SIGHUP)
       (go
         (loop []
           (let [sig (async/<! sig-ch)]
             (when sig
               (when-let [pid @primary-pid]
-                (try (syscall/kill pid sig) (catch e nil)))
+                (try (sys/kill pid sig) (catch e nil)))
               (recur)))))
 
       ;; reaper — drain any pre-existing exits and then block on SIGCHLD.
       (go
         (let [drain (fn []
                       (loop []
-                        (let [wr (try (syscall/waitpid -1 syscall/WNOHANG)
-                                      (catch e {:pid 0}))]
-                          (when (> (:pid wr) 0)
-                            (async/>! state-ch {:op :reap :pid (:pid wr) :wr wr})
+                        (let [{:keys [pid] :as wr} (try (sys/waitpid -1 sys/WNOHANG)
+                                                        (catch e {:pid 0}))]
+                          (when (> pid 0)
+                            (async/>! state-ch {:op :reap :pid pid :wr wr})
                             (recur)))))]
           (drain)
           (loop []
@@ -434,14 +483,10 @@
 
       ;; Block until the primary child exits. handle-exec-conn writes to
       ;; p-exit when it finishes a :primary request.
-      (let [wr (async/<! p-exit)
-            sg (:signal wr)
-            st (:status wr)]
+      (let [{:keys [signal status]} (async/<! p-exit)]
         (try (unix/close listener) (catch e nil))
-        (try (syscall/rm sock-path) (catch e nil))
-        (os/exit (cond
-                   (> sg 0) (+ 128 sg)
-                   :else    st))))))
+        (try (sys/rm sock-path) (catch e nil))
+        (os/exit (if (> signal 0) (+ 128 signal) status))))))
 
 ;; ---------------------------------------------------------------------------
 ;; container run (host side)
@@ -451,7 +496,7 @@
 (defn self-prefix []
   (let [self (first os/args)
         second-arg (str (second os/args))
-        bundled? (not (string/ends-with? second-arg ".lg"))]
+        bundled? (not (str/ends-with? second-arg ".lg"))]
     (if bundled? [self] [self second-arg])))
 
 (defn child-env
@@ -479,21 +524,19 @@
 
 (defn- primary-request
   "Build the :primary exec request from a container's state + stdio fds."
-  [state]
-  (let [cmd     (:command state)
-        args    (lib/strip-nils (:args state))
-        img-env (lib/strip-nils (or (:env-image state) []))
-        usr-env (lib/strip-nils (or (:env state) []))
-        env     (lib/merge-env img-env
+  [{:keys [command args env env-image hostname workdir user]}]
+  (let [img-env (lib/strip-nils (or env-image []))
+        usr-env (lib/strip-nils (or env []))
+        merged  (lib/merge-env img-env
                                (conj usr-env
-                                     (str "HOSTNAME=" (:hostname state))
+                                     (str "HOSTNAME=" hostname)
                                      "HOME=/root"
                                      "TERM=xterm"))]
     {:primary true
-     :argv    (into [cmd] args)
-     :env     (vec env)
-     :workdir (:workdir state)
-     :user    (:user state)}))
+     :argv    (into [command] (lib/strip-nils args))
+     :env     (vec merged)
+     :workdir workdir
+     :user    user}))
 
 (defn- send-primary
   "Connect to init's ctrl.sock, send the :primary request with fds, and read
@@ -538,12 +581,13 @@
       (pos? wr-sg)     {:exit 0 :signal wr-sg}
       :else            {:exit (or (:status init-wr) 0) :signal 0})))
 
-(defn cleanup-container [rootfs cg-path]
+(defn cleanup-container [{:keys [merged run-dir mounts]} cg-path]
+  (unmount-bind-mounts merged mounts)
   (try
-    (syscall/umount (:merged rootfs) 0)
+    (sys/umount merged 0)
     (catch e nil))
   (try
-    (sh! "rm" "-rf" (:run-dir rootfs))
+    (sh! "rm" "-rf" run-dir)
     (catch e nil))
   (when cg-path
     (try
@@ -556,7 +600,7 @@
   ;; in the container dir.
   (let [argv (into (self-prefix) ["shim" container-id])
         shim-err (open (str (container-dir container-id) "/shim.log") :write)
-        res  (syscall/spawn-async (first argv) argv (child-env) 0 nil nil shim-err)]
+        res  (sys/spawn-async (first argv) argv (child-env) 0 nil nil shim-err)]
     (close! shim-err)
     (println container-id)
     (os/exit 0)))
@@ -566,20 +610,20 @@
    (primary's stdio flows through the control socket via SCM_RIGHTS)."
   [container-id]
   (let [argv       (into (self-prefix) ["init" container-id])
-        cloneflags (bit-or (bit-or syscall/CLONE_NEWNS  syscall/CLONE_NEWPID)
-                           (bit-or syscall/CLONE_NEWUTS syscall/CLONE_NEWIPC))]
-    (syscall/spawn-async (first argv) argv (child-env) cloneflags nil nil nil)))
+        cloneflags (bit-or (bit-or sys/CLONE_NEWNS  sys/CLONE_NEWPID)
+                           (bit-or sys/CLONE_NEWUTS sys/CLONE_NEWIPC))]
+    (sys/spawn-async (first argv) argv (child-env) cloneflags nil nil nil)))
 
 (defn- do-run-finalize
   "Write the terminal state, clean up, and exit with the mapped code."
   [container-id rootfs cg-path exit-code signal banner?]
-  (let [fin (now-stamp)]
+  (let [{:keys [iso epoch]} (now-stamp)]
     (update-state container-id assoc
                   :status    (if (pos? (or signal 0)) "killed" "exited")
                   :exit-code exit-code
                   :signal    (when (pos? (or signal 0)) signal)
-                  :finished  (:iso fin)
-                  :finished-epoch (:epoch fin))
+                  :finished  iso
+                  :finished-epoch epoch)
     (when banner?
       (println)
       (println (str "[lgcr] container exited with status " exit-code)))
@@ -592,32 +636,29 @@
                :else                exit-code))))
 
 (defn do-run-foreground [container-id]
-  (let [state   (read-state container-id)
-        rootfs  (setup-rootfs (:rootfs-src state) container-id)
-        cg-path (when (seq (:limits state))
-                  (setup-cgroups container-id (:limits state)))]
+  (let [{:keys [rootfs-src limits mounts]} (read-state container-id)
+        rootfs  (assoc (setup-rootfs rootfs-src container-id) :mounts mounts)
+        cg-path (when (seq limits) (setup-cgroups container-id limits))
+        {:keys [merged run-dir]} rootfs]
 
     (println (str "[lgcr] id=" (lib/short-id container-id)))
-    (println (str "[lgcr] rootfs=" (:merged rootfs)))
+    (println (str "[lgcr] rootfs=" merged))
 
-    (let [started (now-stamp)]
+    (let [{:keys [iso epoch]} (now-stamp)]
       (update-state container-id assoc
                     :status "running"
-                    :started (:iso started)
-                    :started-epoch (:epoch started)
+                    :started iso
+                    :started-epoch epoch
                     :cgroup cg-path
-                    :rootfs-merged (:merged rootfs)
-                    :run-dir (:run-dir rootfs)))
+                    :rootfs-merged merged
+                    :run-dir run-dir))
 
-    (let [res       (do-run-spawn-init container-id)
-          init-pid  (:pid res)
-          _         (update-state container-id assoc :pid init-pid)
-          st2       (read-state container-id)
-          ex        (run-primary-and-wait st2 [*in* *out* *err*] false)
-          init-wr   (syscall/waitpid init-pid 0)
-          final     (derive-exit ex init-wr)]
-      (do-run-finalize container-id rootfs cg-path
-                       (or (:exit final) 0) (or (:signal final) 0) true))))
+    (let [{init-pid :pid} (do-run-spawn-init container-id)
+          _    (update-state container-id assoc :pid init-pid)
+          st2  (read-state container-id)
+          ex   (run-primary-and-wait st2 [*in* *out* *err*] false)
+          {:keys [exit signal]} (derive-exit ex (sys/waitpid init-pid 0))]
+      (do-run-finalize container-id rootfs cg-path (or exit 0) (or signal 0) true))))
 
 (defn do-run-foreground-tty
   "Interactive foreground `run -it`. Allocates a pty on the host, passes the
@@ -627,29 +668,26 @@
   [container-id]
   (when-not (term/tty? *in*)
     (die "the input device is not a TTY"))
-  (let [state   (read-state container-id)
-        rootfs  (setup-rootfs (:rootfs-src state) container-id)
-        cg-path (when (seq (:limits state))
-                  (setup-cgroups container-id (:limits state)))]
-    (let [started (now-stamp)]
+  (let [{:keys [rootfs-src limits mounts]} (read-state container-id)
+        rootfs  (assoc (setup-rootfs rootfs-src container-id) :mounts mounts)
+        cg-path (when (seq limits) (setup-cgroups container-id limits))
+        {:keys [merged run-dir]} rootfs]
+    (let [{:keys [iso epoch]} (now-stamp)]
       (update-state container-id assoc
                     :status "running"
-                    :started (:iso started)
-                    :started-epoch (:epoch started)
+                    :started iso
+                    :started-epoch epoch
                     :cgroup cg-path
-                    :rootfs-merged (:merged rootfs)
-                    :run-dir (:run-dir rootfs)
+                    :rootfs-merged merged
+                    :run-dir run-dir
                     :tty? true))
-    (let [res      (do-run-spawn-init container-id)
-          init-pid (:pid res)
+    (let [{init-pid :pid} (do-run-spawn-init container-id)
           _        (update-state container-id assoc :pid init-pid)
-          pty      (term/open-pty)
-          master   (:master pty)
-          slave    (:slave pty)
+          {:keys [master slave]} (term/open-pty)
           sz       (term/size)
           saved    (term/raw-mode! *in*)
           st2      (read-state container-id)]
-      (when sz (term/set-size master (first sz) (second sz)))
+      (when-let [[cols rows] sz] (term/set-size master cols rows))
       ;; stdin → master
       (go
         (loop []
@@ -667,24 +705,22 @@
                     (recur))
                 (async/>! reader-done true)))))
         (let [win-ch (async/chan 4)]
-          (syscall/signal-notify win-ch syscall/SIGWINCH)
+          (sys/signal-notify win-ch sys/SIGWINCH)
           (go
             (loop []
               (when (async/<! win-ch)
-                (let [wz (term/size)]
-                  (when wz
-                    (try (term/set-size master (first wz) (second wz)) (catch e nil))))
+                (when-let [[cols rows] (term/size)]
+                  (try (term/set-size master cols rows) (catch e nil)))
                 (recur)))))
-        (let [conn    (send-primary st2 [slave slave slave] true
-                                    (fn [] (try (unix/close slave) (catch e nil))))
-              ex      (read-exited conn)
-              init-wr (syscall/waitpid init-pid 0)
-              final   (derive-exit ex init-wr)]
+        (let [conn (send-primary st2 [slave slave slave] true
+                                 (fn [] (try (unix/close slave) (catch e nil))))
+              {:keys [exit signal]} (derive-exit (read-exited conn)
+                                                 (sys/waitpid init-pid 0))]
           (async/<! reader-done)
           (try (term/restore-mode! *in* saved) (catch e nil))
           (try (unix/close master) (catch e nil))
           (do-run-finalize container-id rootfs cg-path
-                           (or (:exit final) 0) (or (:signal final) 0) false))))))
+                           (or exit 0) (or signal 0) false))))))
 
 ;; lib/parse-image-ref + image-rootfs-dir live in lib.lg
 
@@ -695,7 +731,7 @@
    Absolute existing dir → bare rootfs (no config).
    Otherwise → treated as image ref, looked up in the image store."
   [target]
-  (if (and (string/starts-with? target "/") (exists? target))
+  (if (and (str/starts-with? target "/") (exists? target))
     {:rootfs target :config nil}
     (let [ref (lib/parse-image-ref target)
           dir (image-dir ref)]
@@ -710,20 +746,22 @@
 
 ;; strip-nils + compose-command live in lib.lg
 
-(defn do-run [target user-cmd user-args opts]
+(defn do-run [target user-cmd user-args
+              {:keys [detached? tty? rm? extra-env hostname mounts] :as opts}]
   (let [{:keys [rootfs config]} (resolve-run-target target)
         [command args] (lib/compose-command config user-cmd user-args die)
         container-id (gen-id)
-        hostname     (get opts :hostname (str "lg-" (lib/short-id container-id)))
+        hostname     (or hostname (str "lg-" (lib/short-id container-id)))
+        mounts       (lib/parse-mount-specs mounts die)
         limits       (select-keys opts [:memory :cpu :pids])
-        detached?    (:detached? opts)
-        tty?         (:tty? opts)]
+        {cfg-workdir :workdir cfg-user :user cfg-env :env} config]
     (when (and detached? tty?)
       (die "-it cannot be combined with -d"))
+    (validate-mount-sources mounts)
 
     ;; initial state.json (everything the shim needs)
-    (syscall/mkdir-p (container-dir container-id) 0755)
-    (let [stamp (now-stamp)]
+    (sys/mkdir-p (container-dir container-id) 0755)
+    (let [{:keys [iso epoch]} (now-stamp)]
       (write-state {:id            container-id
                     :status        "created"
                     :rootfs-src    rootfs
@@ -731,15 +769,16 @@
                     :command       command
                     :args          args
                     :hostname      hostname
-                    :workdir       (or (:workdir config) "")
-                    :user          (or (:user config) "")
-                    :env-image     (or (:env config) [])
-                    :env           (or (:extra-env opts) [])
+                    :workdir       (or cfg-workdir "")
+                    :user          (or cfg-user "")
+                    :env-image     (or cfg-env [])
+                    :env           (or extra-env [])
+                    :mounts        mounts
                     :limits        limits
                     :detached?     (boolean detached?)
-                    :rm?           (boolean (:rm? opts))
-                    :created       (:iso stamp)
-                    :created-epoch (:epoch stamp)
+                    :rm?           (boolean rm?)
+                    :created       iso
+                    :created-epoch epoch
                     :pid           nil
                     :exit-code     nil
                     :signal        nil
@@ -765,37 +804,33 @@
 ;; ---------------------------------------------------------------------------
 
 (defn do-shim [container-id]
-  (let [state      (read-state container-id)
-        stdout-log (str (container-dir container-id) "/stdout.log")
-        stderr-log (str (container-dir container-id) "/stderr.log")
-        stdout-h   (open stdout-log :write)
-        stderr-h   (open stderr-log :write)
-        rootfs     (setup-rootfs (:rootfs-src state) container-id)
-        cg-path    (when (seq (:limits state))
-                     (setup-cgroups container-id (:limits state)))]
+  (let [{:keys [rootfs-src limits mounts]} (read-state container-id)
+        dir       (container-dir container-id)
+        stdout-h  (open (str dir "/stdout.log") :write)
+        stderr-h  (open (str dir "/stderr.log") :write)
+        rootfs    (assoc (setup-rootfs rootfs-src container-id) :mounts mounts)
+        cg-path   (when (seq limits) (setup-cgroups container-id limits))
+        {:keys [merged run-dir]} rootfs]
 
-    (let [started (now-stamp)]
+    (let [{:keys [iso epoch]} (now-stamp)]
       (update-state container-id assoc
                     :status "running"
-                    :started (:iso started)
-                    :started-epoch (:epoch started)
+                    :started iso
+                    :started-epoch epoch
                     :cgroup cg-path
-                    :rootfs-merged (:merged rootfs)
-                    :run-dir (:run-dir rootfs)))
+                    :rootfs-merged merged
+                    :run-dir run-dir))
 
-    (let [res      (do-run-spawn-init container-id)
-          init-pid (:pid res)
-          _        (update-state container-id assoc :pid init-pid)
-          st2      (read-state container-id)
-          null-in  (open "/dev/null" :read)
-          ex       (run-primary-and-wait st2 [null-in stdout-h stderr-h] false)]
+    (let [{init-pid :pid} (do-run-spawn-init container-id)
+          _       (update-state container-id assoc :pid init-pid)
+          st2     (read-state container-id)
+          null-in (open "/dev/null" :read)
+          ex      (run-primary-and-wait st2 [null-in stdout-h stderr-h] false)]
       (close! null-in)
-      (let [init-wr (syscall/waitpid init-pid 0)
-            final   (derive-exit ex init-wr)]
+      (let [{:keys [exit signal]} (derive-exit ex (sys/waitpid init-pid 0))]
         (close! stdout-h)
         (close! stderr-h)
-        (do-run-finalize container-id rootfs cg-path
-                         (or (:exit final) 0) (or (:signal final) 0) false)))))
+        (do-run-finalize container-id rootfs cg-path (or exit 0) (or signal 0) false)))))
 
 ;; ---------------------------------------------------------------------------
 ;; logs — print or tail stdout/stderr of a container
@@ -828,25 +863,23 @@
 
 ;; pad-right + format-cmd + render-status live in lib.lg
 
-(defn do-ps [opts]
-  (let [all?   (:all? opts)
-        quiet? (:quiet? opts)
-        ids    (list-container-ids)
-        rows   (->> ids
-                    (reduce (fn [acc id]
-                              (let [st (try
-                                         (let [s (read-state id)]
-                                           (assoc s :effective-status (effective-status s)))
-                                         (catch e nil))]
-                                (if st (conj acc st) acc)))
-                            [])
-                    (filter (fn [s] (or all?
-                                        (= "running" (:effective-status s))))))
-        now-e  (now-epoch)]
+(defn do-ps [{:keys [all? quiet?]}]
+  (let [rows  (->> (list-container-ids)
+                   (reduce (fn [acc id]
+                             (if-let [st (try
+                                           (let [s (read-state id)]
+                                             (assoc s :effective-status (effective-status s)))
+                                           (catch e nil))]
+                               (conj acc st)
+                               acc))
+                           [])
+                   (filter (fn [{:keys [effective-status]}]
+                             (or all? (= "running" effective-status)))))
+        now-e (now-epoch)]
     (cond
       quiet?
-      (doseq [s rows]
-        (println (lib/short-id (:id s))))
+      (doseq [{:keys [id]} rows]
+        (println (lib/short-id id)))
 
       (empty? rows)
       nil  ;; keep grep-friendly
@@ -857,10 +890,10 @@
                       (lib/pad-right "STATUS" 32)
                       (lib/pad-right "CREATED" 22)
                       "COMMAND"))
-        (doseq [s rows]
-          (println (str (lib/pad-right (lib/short-id (:id s)) 14)
+        (doseq [{:keys [id created-epoch] :as s} rows]
+          (println (str (lib/pad-right (lib/short-id id) 14)
                         (lib/pad-right (lib/render-status s now-e) 32)
-                        (lib/pad-right (str (lib/humanize-ago (- now-e (:created-epoch s))) " ago") 22)
+                        (lib/pad-right (str (lib/humanize-ago (- now-e created-epoch)) " ago") 22)
                         (lib/format-cmd s))))))))
 
 ;; ---------------------------------------------------------------------------
@@ -868,28 +901,25 @@
 ;; ---------------------------------------------------------------------------
 
 (defn do-kill [id-prefix sig]
-  (let [id (or (resolve-id id-prefix) (die "no such container: " id-prefix))
-        st (read-state id)]
-    (when-not (= "running" (effective-status st))
+  (let [id (require-id id-prefix)
+        {:keys [pid] :as state} (read-state id)]
+    (when-not (= "running" (effective-status state))
       (die "container " (lib/short-id id) " is not running"))
-    (syscall/kill (:pid st) sig)
+    (sys/kill pid sig)
     (println (lib/short-id id))))
 
 (defn do-stop [id-prefix grace-secs]
-  (let [id (or (resolve-id id-prefix) (die "no such container: " id-prefix))
-        st (read-state id)]
-    (cond
-      (not= "running" (effective-status st))
+  (let [id (require-id id-prefix)
+        {:keys [pid] :as state} (read-state id)]
+    (if (not= "running" (effective-status state))
       (do (println (lib/short-id id)) nil)  ;; idempotent
-
-      :else
-      (let [pid (:pid st)]
-        (syscall/kill pid syscall/SIGTERM)
+      (do
+        (sys/kill pid sys/SIGTERM)
         ;; poll for up to grace-secs * 10 (100ms each)
         (loop [remaining (* 10 grace-secs)]
           (cond
             (not (pid-alive? pid)) nil
-            (<= remaining 0)       (do (syscall/kill pid syscall/SIGKILL)
+            (<= remaining 0)       (do (sys/kill pid sys/SIGKILL)
                                        (sleep 200))
             :else                  (do (sleep 100) (recur (- remaining 1)))))
         (println (lib/short-id id))))))
@@ -899,24 +929,25 @@
 ;; ---------------------------------------------------------------------------
 
 (defn do-rm [id-prefix force?]
-  (let [id (or (resolve-id id-prefix) (die "no such container: " id-prefix))
-        st (read-state id)
-        status (effective-status st)]
+  (let [id (require-id id-prefix)
+        {:keys [pid rootfs-merged run-dir cgroup mounts] :as state} (read-state id)
+        status (effective-status state)]
     (cond
       (and (= status "running") (not force?))
       (die "container " (lib/short-id id)
            " is running — use -f to force, or stop it first")
 
       (= status "running")
-      (do (syscall/kill (:pid st) syscall/SIGKILL)
+      (do (sys/kill pid sys/SIGKILL)
           (sleep 200)))
     ;; cleanup leftover overlay / cgroup just in case the shim didn't finish
-    (when-let [merged (:rootfs-merged st)]
-      (try (syscall/umount merged 0) (catch e nil)))
-    (when-let [run-dir (:run-dir st)]
+    (when rootfs-merged
+      (unmount-bind-mounts rootfs-merged mounts)
+      (try (sys/umount rootfs-merged 0) (catch e nil)))
+    (when run-dir
       (try (sh! "rm" "-rf" run-dir) (catch e nil)))
-    (when-let [cg (:cgroup st)]
-      (try (sh! "rmdir" cg) (catch e nil)))
+    (when cgroup
+      (try (sh! "rmdir" cgroup) (catch e nil)))
     (sh! "rm" "-rf" (container-dir id))
     (println (lib/short-id id))))
 
@@ -925,7 +956,7 @@
 ;; ---------------------------------------------------------------------------
 
 (defn do-inspect [id-prefix]
-  (let [id (or (resolve-id id-prefix) (die "no such container: " id-prefix))]
+  (let [id (require-id id-prefix)]
     ;; slurp raw so we don't re-encode; add trailing newline if missing
     (let [raw (slurp (state-path id))]
       (print raw)
@@ -948,21 +979,18 @@
   (when-not (term/tty? *in*)
     (unix/close conn)
     (die "the input device is not a TTY"))
-  (let [pty        (term/open-pty)
-        master     (:master pty)
-        slave      (:slave pty)
-        ;; Mirror the terminal's current size to the pty before the child starts.
-        initial-sz (term/size)]
-    (when initial-sz
-      (term/set-size master (first initial-sz) (second initial-sz)))
+  (let [{:keys [master slave]} (term/open-pty)]
+    ;; Mirror the terminal's current size to the pty before the child starts.
+    (when-let [[cols rows] (term/size)]
+      (term/set-size master cols rows))
     (unix/send conn (json/write-json (assoc req :tty true)) [slave slave slave])
     ;; We don't need the slave anymore — init's handle-exec-conn has its own dup.
     (unix/close slave)
-    (let [started (exec-wait-reply conn)]
-      (when (:error started)
+    (let [{:keys [error pid] :as started} (exec-wait-reply conn)]
+      (when error
         (unix/close master) (unix/close conn)
-        (die "exec failed: " (:error started)))
-      (when-not (:pid started)
+        (die "exec failed: " error))
+      (when-not pid
         (unix/close master) (unix/close conn)
         (die "exec failed: unexpected reply " started)))
     ;; Raw mode on our terminal so Ctrl-C / arrow keys / line editing all
@@ -986,63 +1014,62 @@
                 (async/>! reader-done true)))))
         ;; SIGWINCH: resize the pty so the child sees our current size.
         (let [win-ch (async/chan 4)]
-          (syscall/signal-notify win-ch syscall/SIGWINCH)
+          (sys/signal-notify win-ch sys/SIGWINCH)
           (go
             (loop []
               (when (async/<! win-ch)
-                (let [sz (term/size)]
-                  (when sz
-                    (try (term/set-size master (first sz) (second sz)) (catch e nil))))
+                (when-let [[cols rows] (term/size)]
+                  (try (term/set-size master cols rows) (catch e nil)))
                 (recur)))))
-        (let [ex (exec-wait-reply conn)
-              sg (or (:signal ex) 0)
-              st (or (:exit ex) 0)]
+        (let [{:keys [exit signal]} (exec-wait-reply conn)
+              sg (or signal 0)
+              st (or exit 0)]
           ;; Let the master reader drain anything the child wrote just before exit.
           (async/<! reader-done)
           (try (term/restore-mode! *in* saved) (catch e nil))
           (try (unix/close master) (catch e nil))
           (try (unix/close conn) (catch e nil))
-          (os/exit (cond (> sg 0) (+ 128 sg) :else st)))))))
+          (os/exit (if (> sg 0) (+ 128 sg) st)))))))
 
 (defn do-exec [id-prefix argv extra-env tty?]
   (when (< (count argv) 1)
     (die "usage: lgcr exec [-it] [-e K=V]... <id> <cmd> [args...]"))
-  (let [id     (or (resolve-id id-prefix) (die "no such container: " id-prefix))
-        st     (read-state id)
-        status (effective-status st)]
+  (let [id    (require-id id-prefix)
+        state (read-state id)
+        {:keys [env-image env]} state
+        status (effective-status state)]
     (when (not= status "running")
       (die "container " (lib/short-id id) " is not running (" status ")"))
     (let [sock (str (container-dir id) "/ctrl.sock")]
       (when-not (exists? sock)
         (die "container " (lib/short-id id) " has no control socket (older container?)"))
       (let [conn    (try (unix/connect sock) (catch e (die "connect " sock ": " e)))
-            img-env (or (:env-image st) [])
-            ctr-env (or (:env st) [])
-            req-env (vec (lib/merge-env img-env (concat ctr-env (or extra-env []))))
+            req-env (vec (lib/merge-env (or env-image [])
+                                        (concat (or env []) (or extra-env []))))
             req     {:argv (vec argv) :env req-env}]
         (if tty?
           (do-exec-tty conn req)
           (do
             (unix/send conn (json/write-json req) [*in* *out* *err*])
-            (let [started (exec-wait-reply conn)]
-              (when (:error started)
+            (let [{:keys [error pid] :as started} (exec-wait-reply conn)]
+              (when error
                 (unix/close conn)
-                (die "exec failed: " (:error started)))
-              (when-not (:pid started)
+                (die "exec failed: " error))
+              (when-not pid
                 (unix/close conn)
                 (die "exec failed: unexpected reply " started)))
-            (let [ex (exec-wait-reply conn)
-                  sg (or (:signal ex) 0)
-                  st (or (:exit ex) 0)]
+            (let [{:keys [exit signal]} (exec-wait-reply conn)
+                  sg (or signal 0)
+                  st (or exit 0)]
               (unix/close conn)
-              (os/exit (cond (> sg 0) (+ 128 sg) :else st)))))))))
+              (os/exit (if (> sg 0) (+ 128 sg) st)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; start — re-spawn a stopped container
 ;; ---------------------------------------------------------------------------
 
 (defn do-start [id-prefix]
-  (let [id (or (resolve-id id-prefix) (die "no such container: " id-prefix))
+  (let [id (require-id id-prefix)
         st (read-state id)
         status (effective-status st)]
     (when (= status "running")
@@ -1062,13 +1089,12 @@
     ;; spawn a fresh shim
     (let [argv (into (self-prefix) ["shim" id])
           shim-err (open (str (container-dir id) "/shim.log") :write)
-          _ (syscall/spawn-async (first argv) argv (child-env) 0 nil nil shim-err)]
+          _ (sys/spawn-async (first argv) argv (child-env) 0 nil nil shim-err)]
       (close! shim-err)
       (println (lib/short-id id)))))
 
 (defn do-logs [id-prefix follow?]
-  (let [id (or (resolve-id id-prefix)
-               (die "no such container: " id-prefix))
+  (let [id (require-id id-prefix)
         dir (container-dir id)
         stop-fn (fn [] (not= "running" (:status (read-state id))))]
     ;; For the minimal version, stream stdout and stderr sequentially: if
@@ -1118,9 +1144,9 @@
         ;; detect arch from our own binary
         our-arch (let [uname (:out (os/sh "uname" "-m"))]
                    (cond
-                     (string/includes? uname "aarch64") "arm64"
-                     (string/includes? uname "x86_64")  "amd64"
-                     (string/includes? uname "arm")     "arm64"
+                     (str/includes? uname "aarch64") "arm64"
+                     (str/includes? uname "x86_64")  "amd64"
+                     (str/includes? uname "arm")     "arm64"
                      :else "amd64"))]
 
     (println (str "[pull] " registry "/" repo ":" tag " (" our-arch ")"))
@@ -1139,19 +1165,17 @@
 
         ;; handle manifest list / OCI index → pick platform, fetch actual manifest
         (let [manifest
-              (if (or (string/includes? (str media-type) "manifest.list")
-                      (string/includes? (str media-type) "image.index"))
+              (if (or (str/includes? (str media-type) "manifest.list")
+                      (str/includes? (str media-type) "image.index"))
                 ;; it's a fat manifest — pick our platform
-                (let [chosen (pick-manifest (:manifests body) our-arch "linux")]
-                  (if (nil? chosen)
-                    (die "no manifest found for " our-arch "/linux")
-                    (do
-                      (println (str "[pull] selected platform: " our-arch "/linux"))
-                      (let [digest (:digest chosen)
-                            resp2  (registry-get registry repo (str "/manifests/" digest) token
-                                                 {:accept (:mediaType chosen)})
-                            body2  (json/read-json (:body resp2) {:keywords? true})]
-                        body2))))
+                (if-let [{:keys [digest mediaType]}
+                         (pick-manifest (:manifests body) our-arch "linux")]
+                  (do
+                    (println (str "[pull] selected platform: " our-arch "/linux"))
+                    (let [resp2 (registry-get registry repo (str "/manifests/" digest) token
+                                              {:accept mediaType})]
+                      (json/read-json (:body resp2) {:keywords? true})))
+                  (die "no manifest found for " our-arch "/linux"))
                 ;; single manifest, use as-is
                 body)
 
@@ -1161,10 +1185,8 @@
           (sh! "mkdir" "-p" rootfs-dir)
 
           ;; download and extract each layer
-          (doseq [layer layers]
-            (let [digest    (:digest layer)
-                  size      (:size layer)
-                  short-dig (subs digest 7 19) ;; sha256:xxxx... → first 12 hex chars
+          (doseq [{:keys [digest size]} layers]
+            (let [short-dig (subs digest 7 19) ;; sha256:xxxx... → first 12 hex chars
                   tmp-file  (str "/tmp/layer-" short-dig ".tar.gz")]
 
               (println (str "[pull] layer " short-dig " (" size " bytes)"))
@@ -1183,24 +1205,30 @@
               (sh! "rm" "-f" tmp-file)))
 
           ;; fetch image config blob (ENTRYPOINT/CMD/ENV/WORKDIR/USER)
-          (when-let [cfg-ref (:config manifest)]
+          (when-let [{cfg-digest :digest} (:config manifest)]
             (println "[pull] fetching image config...")
-            (let [resp (registry-get registry repo
-                                     (str "/blobs/" (:digest cfg-ref))
-                                     token
+            (let [resp (registry-get registry repo (str "/blobs/" cfg-digest) token
                                      {:accept "application/octet-stream"})
-                  full (json/read-json (:body resp) {:keywords? true})
-                  inner (:config full)
-                  reduced {:env        (or (:Env inner) [])
-                           :cmd        (or (:Cmd inner) [])
-                           :entrypoint (or (:Entrypoint inner) [])
-                           :workdir    (or (:WorkingDir inner) "")
-                           :user       (or (:User inner) "")
-                           :ref        (str (:repo parsed) ":" (:tag parsed))
-                           :registry   (:registry parsed)
-                           :pulled-epoch (now-epoch)}]
-              (spit (str rootfs-dir "/.lgcr-config.json")
-                    (json/write-json reduced))))
+                  {:keys [config architecture]} (json/read-json (:body resp) {:keywords? true})
+                  {:keys [Env Cmd Entrypoint WorkingDir User]} config
+                  img-arch (or architecture "")]
+              (when (and (not= "" img-arch) (not= img-arch our-arch))
+                ;; wipe the partial rootfs so we don't leave a broken image
+                ;; around (and so a retry with a matching arch works cleanly)
+                (try (sys/rm-rf rootfs-dir) (catch e nil))
+                (die "image is " img-arch " but host is " our-arch
+                     " — no " our-arch " variant is available for "
+                     repo ":" tag))
+              (let [reduced {:env          (or Env [])
+                             :cmd          (or Cmd [])
+                             :entrypoint   (or Entrypoint [])
+                             :workdir      (or WorkingDir "")
+                             :user         (or User "")
+                             :ref          (str repo ":" tag)
+                             :registry     registry
+                             :pulled-epoch (now-epoch)}]
+                (spit (str rootfs-dir "/.lgcr-config.json")
+                      (json/write-json reduced)))))
 
           (println (str "[pull] rootfs ready at " rootfs-dir))
           rootfs-dir)))))
@@ -1218,7 +1246,7 @@
   [dir]
   (let [r (os/sh "du" "-sb" dir)]
     (when (= 0 (:exit r))
-      (try (parse-int (first (string/split (string/trim (:out r)) "\t")))
+      (try (parse-int (first (str/split (str/trim (:out r)) "\t")))
            (catch e nil)))))
 
 (defn- list-image-entries
@@ -1233,17 +1261,18 @@
              (if (= "" name)
                acc
                (let [dir  (str root "/" name)
-                     cfg  (let [p (str dir "/.lgcr-config.json")]
-                            (when (exists? p)
-                              (try (json/read-json (slurp p) {:keywords? true})
-                                   (catch e nil))))]
+                     {:keys [ref pulled-epoch]}
+                     (let [p (str dir "/.lgcr-config.json")]
+                       (when (exists? p)
+                         (try (json/read-json (slurp p) {:keywords? true})
+                              (catch e nil))))]
                  (conj acc {:dir          dir
                             :subdir       name
-                            :ref          (or (:ref cfg) name)
-                            :pulled-epoch (:pulled-epoch cfg)
+                            :ref          (or ref name)
+                            :pulled-epoch pulled-epoch
                             :size         (dir-size-bytes dir)}))))
            []
-           (string/split (:out ls) "\n"))
+           (str/split (:out ls) "\n"))
           []))
       [])))
 
@@ -1251,20 +1280,19 @@
   "Return a seq of container ids whose :rootfs-src matches the given image dir."
   [image-dir]
   (reduce (fn [acc id]
-            (let [st (try (read-state id) (catch e nil))]
-              (if (and st (= image-dir (:rootfs-src st)))
+            (let [{:keys [rootfs-src]} (try (read-state id) (catch e nil))]
+              (if (= image-dir rootfs-src)
                 (conj acc id)
                 acc)))
           []
           (list-container-ids)))
 
-(defn do-images [opts]
-  (let [quiet? (:quiet? opts)
-        rows   (list-image-entries)
-        now-e  (now-epoch)]
+(defn do-images [{:keys [quiet?]}]
+  (let [rows  (list-image-entries)
+        now-e (now-epoch)]
     (cond
       quiet?
-      (doseq [e rows] (println (:ref e)))
+      (doseq [{:keys [ref]} rows] (println ref))
 
       (empty? rows)
       nil
@@ -1274,11 +1302,11 @@
         (println (str (lib/pad-right "IMAGE" 40)
                       (lib/pad-right "SIZE" 12)
                       "PULLED"))
-        (doseq [e rows]
-          (let [age (when (:pulled-epoch e)
-                      (str (lib/humanize-ago (- now-e (:pulled-epoch e))) " ago"))]
-            (println (str (lib/pad-right (:ref e) 40)
-                          (lib/pad-right (lib/humanize-bytes (:size e)) 12)
+        (doseq [{:keys [ref size pulled-epoch]} rows]
+          (let [age (when pulled-epoch
+                      (str (lib/humanize-ago (- now-e pulled-epoch)) " ago"))]
+            (println (str (lib/pad-right ref 40)
+                          (lib/pad-right (lib/humanize-bytes size) 12)
                           (or age "-")))))))))
 
 (defn- stopped-container-ids []
@@ -1300,35 +1328,34 @@
 (defn do-prune
   "Remove stopped containers and/or unused images. With no flags, both.
    An image is 'unused' when no container's :rootfs-src matches its dir."
-  [opts]
-  (let [containers? (or (:containers? opts) (not (or (:containers? opts)
-                                                     (:images? opts))))
-        images?     (or (:images? opts)     (not (or (:containers? opts)
-                                                     (:images? opts))))
-        c-result    (when containers?
+  [{:keys [containers? images?]}]
+  (let [neither?    (not (or containers? images?))
+        do-c?       (or containers? neither?)
+        do-i?       (or images?     neither?)
+        c-result    (when do-c?
                       (let [ids   (stopped-container-ids)
                             bytes (reduce (fn [a id] (+ a (container-disk-bytes id)))
                                           0 ids)]
                         (doseq [id ids] (do-rm id false))
                         {:n (count ids) :bytes bytes}))
-        i-result    (when images?
+        i-result    (when do-i?
                       ;; Re-scan users *after* container prune so freshly
                       ;; orphaned images become eligible.
                       (let [entries (list-image-entries)
-                            unused  (filter (fn [e]
-                                              (empty? (containers-using-image (:dir e))))
+                            unused  (filter (fn [{:keys [dir]}]
+                                              (empty? (containers-using-image dir)))
                                             entries)
-                            bytes   (reduce (fn [a e] (+ a (or (:size e) 0)))
+                            bytes   (reduce (fn [a {:keys [size]}] (+ a (or size 0)))
                                             0 unused)]
-                        (doseq [e unused]
-                          (syscall/rm-rf (:dir e))
-                          (println (str "removed image " (:ref e)
-                                        " (" (lib/humanize-bytes (or (:size e) 0)) ")")))
+                        (doseq [{:keys [dir ref size]} unused]
+                          (sys/rm-rf dir)
+                          (println (str "removed image " ref
+                                        " (" (lib/humanize-bytes (or size 0)) ")")))
                         {:n (count unused) :bytes bytes}))
-        c-n         (get c-result :n 0)
-        c-b         (get c-result :bytes 0)
-        i-n         (get i-result :n 0)
-        i-b         (get i-result :bytes 0)]
+        c-n (get c-result :n 0)
+        c-b (get c-result :bytes 0)
+        i-n (get i-result :n 0)
+        i-b (get i-result :bytes 0)]
     (println (str "pruned " c-n " container(s), " i-n " image(s); "
                   "reclaimed " (lib/humanize-bytes (+ c-b i-b))))))
 
@@ -1340,10 +1367,10 @@
     (let [users (containers-using-image dir)]
       (when (and (seq users) (not force?))
         (die "image " target " is used by " (count users) " container(s): "
-             (string/join ", " (reduce (fn [a i] (conj a (lib/short-id i))) [] users))
+             (str/join ", " (mapv lib/short-id users))
              " (use -f to remove anyway)")))
     (let [size (or (dir-size-bytes dir) 0)]
-      (syscall/rm-rf dir)
+      (sys/rm-rf dir)
       (println (str "removed " target " (" (lib/humanize-bytes size) ")")))))
 
 ;; ---------------------------------------------------------------------------
@@ -1353,30 +1380,23 @@
 ;; detect bundled vs interpreted mode:
 ;; interpreted: [binary, script.lg, subcmd, ...]  → drop 2
 ;; bundled:     [binary, subcmd, ...]              → drop 1
-(let [bundled? (not (string/ends-with? (str (second os/args)) ".lg"))
+(let [bundled? (not (str/ends-with? (str (second os/args)) ".lg"))
       args     (drop (if bundled? 1 2) os/args)
       subcmd   (first args)
       tail     (vec (drop 1 args))]
   (cond
     (= subcmd "run")
-    ;; parse flags: -d (detach), --rm, -e K=V, -i/-t (pty)
     (let [[flags rest-args]
-          (loop [flags {} xs (split-short-flags tail)]
-            (cond
-              (empty? xs) [flags xs]
-              (= "-d" (first xs))   (recur (assoc flags :detached? true) (rest xs))
-              (= "--rm" (first xs)) (recur (assoc flags :rm? true) (rest xs))
-              (= "-t" (first xs))   (recur (assoc flags :tty? true) (rest xs))
-              (= "-i" (first xs))   (recur flags (rest xs))
-              (= "-e" (first xs))   (recur (update flags :extra-env
-                                                   (fn [e] (conj (or e []) (second xs))))
-                                           (drop 2 xs))
-              :else [flags xs]))]
-      (cond
-        (< (count rest-args) 1)
-        (die "usage: lgcr run [-d|-it] [--rm] [-e K=V]... <image-or-rootfs> [command [args...]]")
-
-        :else
+          (lib/parse-flags {"-d"   [:detached? :bool]
+                            "--rm" [:rm?       :bool]
+                            "-t"   [:tty?      :bool]
+                            "-i"   [:_i        :ignore]
+                            "-e"   [:extra-env :accumulate]
+                            "-v"   [:mounts    :accumulate]
+                            "--mount" [:mounts :accumulate]}
+                           tail)]
+      (if (< (count rest-args) 1)
+        (die "usage: lgcr run [-d|-it] [--rm] [-e K=V]... [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image-or-rootfs> [command [args...]]")
         (do-run (first rest-args)
                 (second rest-args)       ;; nil if not given
                 (vec (drop 2 rest-args))
@@ -1388,57 +1408,32 @@
       (do-shim (first tail)))
 
     (= subcmd "logs")
-    (let [[flags rest-args]
-          (loop [flags {} xs (split-short-flags tail)]
-            (cond
-              (empty? xs) [flags xs]
-              (= "-f" (first xs)) (recur (assoc flags :follow? true) (rest xs))
-              :else [flags xs]))]
+    (let [[flags rest-args] (lib/parse-flags {"-f" [:follow? :bool]} tail)]
       (if (< (count rest-args) 1)
         (die "usage: lgcr logs [-f] <id>")
         (do-logs (first rest-args) (:follow? flags))))
 
     (= subcmd "ps")
-    (let [flags (loop [f {} xs (split-short-flags tail)]
-                  (cond
-                    (empty? xs) f
-                    (= "-a" (first xs)) (recur (assoc f :all? true) (rest xs))
-                    (= "-q" (first xs)) (recur (assoc f :quiet? true) (rest xs))
-                    :else f))]
+    (let [[flags _] (lib/parse-flags {"-a" [:all?   :bool]
+                                      "-q" [:quiet? :bool]} tail)]
       (do-ps flags))
 
     (= subcmd "stop")
-    (let [[flags rest-args]
-          (loop [f {} xs (split-short-flags tail)]
-            (cond
-              (empty? xs) [f xs]
-              (= "-t" (first xs)) (recur (assoc f :grace (parse-int (second xs)))
-                                         (drop 2 xs))
-              :else [f xs]))]
+    (let [[flags rest-args] (lib/parse-flags {"-t" [:grace :int]} tail)]
       (if (< (count rest-args) 1)
         (die "usage: lgcr stop [-t SECS] <id>...")
         (doseq [id rest-args]
           (do-stop id (or (:grace flags) 10)))))
 
     (= subcmd "kill")
-    (let [[flags rest-args]
-          (loop [f {} xs (split-short-flags tail)]
-            (cond
-              (empty? xs) [f xs]
-              (= "-s" (first xs)) (recur (assoc f :signal (second xs)) (drop 2 xs))
-              :else [f xs]))]
+    (let [[flags rest-args] (lib/parse-flags {"-s" [:signal :value]} tail)]
       (if (< (count rest-args) 1)
         (die "usage: lgcr kill [-s SIG] <id>...")
-        (let [sig (lib/parse-signal (:signal flags))]
+        (let [sig (lib/parse-signal (:signal flags) die)]
           (doseq [id rest-args] (do-kill id sig)))))
 
     (= subcmd "rm")
-    (let [[flags rest-args]
-          (loop [f {} xs (split-short-flags tail)]
-            (cond
-              (empty? xs) [f xs]
-              (= "-f" (first xs)) (recur (assoc f :force? true) (rest xs))
-              :else [f xs]))]
+    (let [[flags rest-args] (lib/parse-flags {"-f" [:force? :bool]} tail)]
       (if (< (count rest-args) 1)
         (die "usage: lgcr rm [-f] <id>...")
         (doseq [id rest-args] (do-rm id (:force? flags)))))
@@ -1450,15 +1445,10 @@
 
     (= subcmd "exec")
     (let [[flags rest-args]
-          (loop [f {} xs (split-short-flags tail)]
-            (cond
-              (empty? xs) [f xs]
-              (= "-e" (first xs)) (recur (update f :extra-env
-                                                 (fn [e] (conj (or e []) (second xs))))
-                                         (drop 2 xs))
-              (= "-t" (first xs)) (recur (assoc f :tty? true) (rest xs))
-              (= "-i" (first xs)) (recur f (rest xs))   ;; accepted, no-op
-              :else [f xs]))]
+          (lib/parse-flags {"-e" [:extra-env :accumulate]
+                            "-t" [:tty?      :bool]
+                            "-i" [:_i        :ignore]}
+                           tail)]
       (if (< (count rest-args) 2)
         (die "usage: lgcr exec [-it] [-e K=V]... <id> <cmd> [args...]")
         (do-exec (first rest-args) (vec (drop 1 rest-args))
@@ -1480,31 +1470,22 @@
       (do-pull (first tail)))
 
     (= subcmd "images")
-    (let [flags (loop [f {} xs (split-short-flags tail)]
-                  (cond
-                    (empty? xs) f
-                    (= "-q" (first xs)) (recur (assoc f :quiet? true) (rest xs))
-                    :else f))]
+    (let [[flags _] (lib/parse-flags {"-q" [:quiet? :bool]} tail)]
       (do-images flags))
 
     (= subcmd "rmi")
-    (let [[flags rest-args]
-          (loop [f {} xs (split-short-flags tail)]
-            (cond
-              (empty? xs) [f xs]
-              (= "-f" (first xs)) (recur (assoc f :force? true) (rest xs))
-              :else [f xs]))]
+    (let [[flags rest-args] (lib/parse-flags {"-f" [:force? :bool]} tail)]
       (if (< (count rest-args) 1)
         (die "usage: lgcr rmi [-f] <image>...")
         (doseq [t rest-args] (do-rmi t (:force? flags)))))
 
     (= subcmd "prune")
-    (let [flags (loop [f {} xs tail]
-                  (cond
-                    (empty? xs) f
-                    (= "--containers" (first xs)) (recur (assoc f :containers? true) (rest xs))
-                    (= "--images"     (first xs)) (recur (assoc f :images? true)     (rest xs))
-                    :else (die "usage: lgcr prune [--containers] [--images]")))]
+    (let [[flags rest-args]
+          (lib/parse-flags {"--containers" [:containers? :bool]
+                            "--images"     [:images?     :bool]}
+                           tail)]
+      (when (seq rest-args)
+        (die "usage: lgcr prune [--containers] [--images]"))
       (do-prune flags))
 
     :else
@@ -1512,7 +1493,7 @@
       (println "let-go container runtime")
       (println)
       (println "usage:")
-      (println "  lgcr run [-d] [--rm] <rootfs-dir> <command> [args...]")
+      (println "  lgcr run [-d] [--rm] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <rootfs-dir> <command> [args...]")
       (println "  lgcr ps [-a] [-q]")
       (println "  lgcr logs [-f] <id>")
       (println "  lgcr stop [-t SECS] <id>...")
