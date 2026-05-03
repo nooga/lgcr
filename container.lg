@@ -261,23 +261,25 @@
         (sys/umount (mount-target-path merged dst) 2) ;; MNT_DETACH
         (catch e nil)))))
 
-(defn apply-readonly-rootfs [merged]
-  (doseq [{:keys [dst opts]} READONLY-TMPFS-MOUNTS]
+(defn mount-tmpfs-mounts [merged mounts]
+  (doseq [{:keys [dst opts]} (lib/strip-nils mounts)]
     (let [target (mount-target-path merged dst)]
       (sys/mkdir-p target 0755)
-      (sys/mount "tmpfs" target "tmpfs" 0 opts)))
-  (sys/mount merged merged "none"
-             (bit-or MS_REMOUNT sys/MS_RDONLY)
-             ""))
+      (sys/mount "tmpfs" target "tmpfs" 0 opts))))
 
-(defn unmount-readonly-tmpfs [merged]
+(defn unmount-tmpfs-mounts [merged mounts]
   (let [reversed (reduce (fn [acc mount] (cons mount acc))
                          []
-                         READONLY-TMPFS-MOUNTS)]
+                         (lib/strip-nils mounts))]
     (doseq [{:keys [dst]} reversed]
       (try
         (sys/umount (mount-target-path merged dst) 2) ;; MNT_DETACH
         (catch e nil)))))
+
+(defn apply-readonly-rootfs [merged]
+  (sys/mount merged merged "none"
+             (bit-or MS_REMOUNT sys/MS_RDONLY)
+             ""))
 
 ;; ---------------------------------------------------------------------------
 ;; container init (runs inside namespaces)
@@ -394,7 +396,7 @@
    opens the control socket, and blocks until a :primary client request
    arrives + that child exits. All user-command spawning goes through
    handle-exec-conn; init itself never runs anything from state.json."
-  [{:keys [id hostname rootfs-merged mounts read-only?]}]
+  [{:keys [id hostname rootfs-merged mounts tmpfs-mounts read-only?]}]
   (let [merged    rootfs-merged
         put-old   (lib/path-join merged ".pivot_old")
         sock-path (str (container-dir id) "/ctrl.sock")
@@ -418,6 +420,9 @@
                                                              sys/MS_NODEV)) "")
       (sys/mount "/dev" dev-dir "none" (bit-or sys/MS_BIND sys/MS_REC) ""))
     (apply-bind-mounts merged mounts)
+    (when read-only?
+      (mount-tmpfs-mounts merged READONLY-TMPFS-MOUNTS))
+    (mount-tmpfs-mounts merged tmpfs-mounts)
     (sh! "mkdir" "-p" put-old)
     (when read-only?
       (apply-readonly-rootfs merged))
@@ -601,10 +606,11 @@
       (pos? wr-sg)     {:exit 0 :signal wr-sg}
       :else            {:exit (or (:status init-wr) 0) :signal 0})))
 
-(defn cleanup-container [{:keys [merged run-dir mounts read-only?]} cg-path]
-  (unmount-bind-mounts merged mounts)
+(defn cleanup-container [{:keys [merged run-dir mounts tmpfs-mounts read-only?]} cg-path]
+  (unmount-tmpfs-mounts merged tmpfs-mounts)
   (when read-only?
-    (unmount-readonly-tmpfs merged))
+    (unmount-tmpfs-mounts merged READONLY-TMPFS-MOUNTS))
+  (unmount-bind-mounts merged mounts)
   (try
     (sys/umount merged 0)
     (catch e nil))
@@ -658,9 +664,10 @@
                :else                exit-code))))
 
 (defn do-run-foreground [container-id]
-  (let [{:keys [rootfs-src limits mounts read-only?]} (read-state container-id)
+  (let [{:keys [rootfs-src limits mounts tmpfs-mounts read-only?]} (read-state container-id)
         rootfs  (assoc (setup-rootfs rootfs-src container-id)
                        :mounts mounts
+                       :tmpfs-mounts tmpfs-mounts
                        :read-only? read-only?)
         cg-path (when (seq limits) (setup-cgroups container-id limits))
         {:keys [merged run-dir]} rootfs]
@@ -692,9 +699,10 @@
   [container-id]
   (when-not (term/tty? *in*)
     (die "the input device is not a TTY"))
-  (let [{:keys [rootfs-src limits mounts read-only?]} (read-state container-id)
+  (let [{:keys [rootfs-src limits mounts tmpfs-mounts read-only?]} (read-state container-id)
         rootfs  (assoc (setup-rootfs rootfs-src container-id)
                        :mounts mounts
+                       :tmpfs-mounts tmpfs-mounts
                        :read-only? read-only?)
         cg-path (when (seq limits) (setup-cgroups container-id limits))
         {:keys [merged run-dir]} rootfs]
@@ -773,12 +781,13 @@
 ;; strip-nils + compose-command live in lib.lg
 
 (defn do-run [target user-cmd user-args
-              {:keys [detached? tty? rm? extra-env hostname workdir mounts read-only?] :as opts}]
+              {:keys [detached? tty? rm? extra-env hostname workdir mounts tmpfs read-only?] :as opts}]
   (let [{:keys [rootfs config]} (resolve-run-target target)
         [command args] (lib/compose-command config user-cmd user-args die)
         container-id (gen-id)
         hostname     (or hostname (str "lg-" (lib/short-id container-id)))
         mounts       (lib/parse-mount-specs mounts die)
+        tmpfs-mounts (lib/parse-tmpfs-specs tmpfs die)
         limits       (select-keys opts [:memory :cpu :pids])
         {cfg-workdir :workdir cfg-user :user cfg-env :env} config]
     (when (and detached? tty?)
@@ -800,6 +809,7 @@
                     :env-image     (or cfg-env [])
                     :env           (or extra-env [])
                     :mounts        mounts
+                    :tmpfs-mounts  tmpfs-mounts
                     :read-only?    (boolean read-only?)
                     :limits        limits
                     :detached?     (boolean detached?)
@@ -831,12 +841,13 @@
 ;; ---------------------------------------------------------------------------
 
 (defn do-shim [container-id]
-  (let [{:keys [rootfs-src limits mounts read-only?]} (read-state container-id)
+  (let [{:keys [rootfs-src limits mounts tmpfs-mounts read-only?]} (read-state container-id)
         dir       (container-dir container-id)
         stdout-h  (open (str dir "/stdout.log") :write)
         stderr-h  (open (str dir "/stderr.log") :write)
         rootfs    (assoc (setup-rootfs rootfs-src container-id)
                          :mounts mounts
+                         :tmpfs-mounts tmpfs-mounts
                          :read-only? read-only?)
         cg-path   (when (seq limits) (setup-cgroups container-id limits))
         {:keys [merged run-dir]} rootfs]
@@ -959,7 +970,7 @@
 
 (defn do-rm [id-prefix force?]
   (let [id (require-id id-prefix)
-        {:keys [pid rootfs-merged run-dir cgroup mounts read-only?] :as state} (read-state id)
+        {:keys [pid rootfs-merged run-dir cgroup mounts tmpfs-mounts read-only?] :as state} (read-state id)
         status (effective-status state)]
     (cond
       (and (= status "running") (not force?))
@@ -971,9 +982,10 @@
           (sleep 200)))
     ;; cleanup leftover overlay / cgroup just in case the shim didn't finish
     (when rootfs-merged
-      (unmount-bind-mounts rootfs-merged mounts)
+      (unmount-tmpfs-mounts rootfs-merged tmpfs-mounts)
       (when read-only?
-        (unmount-readonly-tmpfs rootfs-merged))
+        (unmount-tmpfs-mounts rootfs-merged READONLY-TMPFS-MOUNTS))
+      (unmount-bind-mounts rootfs-merged mounts)
       (try (sys/umount rootfs-merged 0) (catch e nil)))
     (when run-dir
       (try (sh! "rm" "-rf" run-dir) (catch e nil)))
@@ -1426,6 +1438,7 @@
                             "-e"   [:extra-env :accumulate]
                             "-v"   [:mounts    :accumulate]
                             "--mount" [:mounts :accumulate]
+                            "--tmpfs" [:tmpfs :accumulate]
                             "--read-only" [:read-only? :bool]
                             "-w" [:workdir :value]
                             "--workdir" [:workdir :value]
@@ -1433,7 +1446,7 @@
                             "--hostname" [:hostname :value]}
                            tail)]
       (if (< (count rest-args) 1)
-        (die "usage: lgcr run [-d|-it] [--rm] [--read-only] [-e K=V]... [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image-or-rootfs> [command [args...]]")
+        (die "usage: lgcr run [-d|-it] [--rm] [--read-only] [--tmpfs DST[:opts]] [-e K=V]... [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image-or-rootfs> [command [args...]]")
         (do-run (first rest-args)
                 (second rest-args)       ;; nil if not given
                 (vec (drop 2 rest-args))
@@ -1532,7 +1545,7 @@
       (println "let-go container runtime")
       (println)
       (println "usage:")
-      (println "  lgcr run [-d] [--rm] [--read-only] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <rootfs-dir> <command> [args...]")
+      (println "  lgcr run [-d] [--rm] [--read-only] [--tmpfs DST[:opts]] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <rootfs-dir> <command> [args...]")
       (println "  lgcr ps [-a] [-q]")
       (println "  lgcr logs [-f] <id>")
       (println "  lgcr stop [-t SECS] <id>...")

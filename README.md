@@ -56,7 +56,7 @@ lgcr logs -f "$cid"
 | `lgcr pull <image>` | Fetch an OCI image (Docker Hub or any v2 registry) |
 | `lgcr images [-q]` | List pulled images (name, size, age); `-q` just refs |
 | `lgcr rmi [-f] <image>...` | Remove an image; refuses if a container uses it unless `-f` |
-| `lgcr run [-d\|-it] [--rm] [--read-only] [-e K=V] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image\|rootfs> [cmd [args...]]` | Run a container; auto-pulls if the image is missing; supports read-only rootfs and bind mounts; `-d` detach, `-it` interactive pty |
+| `lgcr run [-d\|-it] [--rm] [--read-only] [--tmpfs DST[:opts]] [-e K=V] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image\|rootfs> [cmd [args...]]` | Run a container; auto-pulls if the image is missing; supports read-only rootfs, tmpfs, and bind mounts; `-d` detach, `-it` interactive pty |
 | `lgcr exec [-it] [-e K=V] [-u USER[:GROUP]] <id> <cmd> [args...]` | Run a command inside a running container; `-it` for a pty; `-u` changes uid/gid |
 | `lgcr ps [-a] [-q]` | List containers; `-a` includes exited, `-q` just ids |
 | `lgcr logs [-f] <id>` | Dump or tail captured stdout/stderr |
@@ -86,6 +86,9 @@ lgcr run --mount type=bind,src="$PWD/config",dst=/config,ro alpine:3.21 cat /con
 
 # Make the image rootfs read-only while keeping /tmp and /run writable
 lgcr run --read-only alpine:3.21 sh -c 'echo ok > /tmp/probe'
+
+# Add an in-memory writable mount
+lgcr run --tmpfs /cache:size=64m,mode=1777 alpine:3.21 sh -c 'echo ok > /cache/probe'
 
 # Override hostname, or run an exec as a different user
 lgcr run --hostname worker-1 alpine:3.21 hostname

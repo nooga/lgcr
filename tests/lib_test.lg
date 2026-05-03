@@ -224,6 +224,23 @@
   (is (= false (lib/valid-mount-dst? "/work/../host"))))
 
 ;; ---------------------------------------------------------------------------
+;; tmpfs mount parsing
+;; ---------------------------------------------------------------------------
+
+(deftest parse-tmpfs-spec-defaults-options
+  (is (= {:dst "/cache" :opts "mode=1777"}
+         (lib/parse-tmpfs-spec "/cache" throw-err))))
+
+(deftest parse-tmpfs-spec-keeps-options
+  (is (= {:dst "/cache" :opts "size=64m,mode=0755,noexec"}
+         (lib/parse-tmpfs-spec "/cache:size=64m,mode=0755,noexec" throw-err))))
+
+(deftest parse-tmpfs-specs-accumulates
+  (is (= [{:dst "/cache" :opts "mode=1777"}
+          {:dst "/run/app" :opts "mode=0755"}]
+         (lib/parse-tmpfs-specs ["/cache" "/run/app:mode=0755"] throw-err))))
+
+;; ---------------------------------------------------------------------------
 ;; parse-signal
 ;; ---------------------------------------------------------------------------
 

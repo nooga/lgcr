@@ -222,6 +222,29 @@
           (or specs [])))
 
 ;; ---------------------------------------------------------------------------
+;; tmpfs mount parsing
+;; ---------------------------------------------------------------------------
+
+(defn parse-tmpfs-spec
+  "Parse --tmpfs DST[:opts]. Options are passed through to mount(2)."
+  [spec on-err]
+  (let [[dst opts extra] (str/split spec ":")]
+    (cond
+      extra
+      (on-err (str "invalid --tmpfs mount: " spec))
+
+      (not (valid-mount-dst? dst))
+      (on-err (str "tmpfs destination must be an absolute container path without '..': " dst))
+
+      :else
+      {:dst dst :opts (if (or (nil? opts) (= "" opts)) "mode=1777" opts)})))
+
+(defn parse-tmpfs-specs [specs on-err]
+  (reduce (fn [acc spec] (conj acc (parse-tmpfs-spec spec on-err)))
+          []
+          (or specs [])))
+
+;; ---------------------------------------------------------------------------
 ;; env helpers
 ;; ---------------------------------------------------------------------------
 

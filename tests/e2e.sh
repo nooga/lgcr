@@ -257,6 +257,24 @@ OUT=$("$LGCR" run --read-only -v "$BIND_DIR:/mnt/host" "$IMG" sh -c "echo ro-roo
 expect_contains "$OUT" "ro-root-bind" "bind mount writable under read-only rootfs"
 expect_eq "$(cat "$BIND_DIR/readonly-root-bind.txt")" "ro-root-bind" "host saw read-only-root bind write"
 
+section "--tmpfs mounts writable tmpfs"
+OUT=$("$LGCR" run --tmpfs /cache:size=1m,mode=1777 "$IMG" sh -c "echo cache-ok > /cache/probe; cat /cache/probe; awk '\$2 == \"/cache\" { print \$3 }' /proc/mounts" 2>&1)
+expect_contains "$OUT" "cache-ok" "tmpfs writable"
+expect_contains "$OUT" "tmpfs" "tmpfs appears in mount table"
+
+section "--tmpfs composes with --read-only"
+OUT=$("$LGCR" run --read-only --tmpfs /cache "$IMG" sh -c "if sh -c 'echo nope > /root-blocked-2' 2>/dev/null; then echo ROOT_WRITE_OK; else echo ROOT_WRITE_FAIL; fi; echo cache-ro-ok > /cache/probe; cat /cache/probe" 2>&1)
+expect_contains "$OUT" "ROOT_WRITE_FAIL" "read-only rootfs still enforced"
+expect_contains "$OUT" "cache-ro-ok" "custom tmpfs writable under read-only rootfs"
+
+section "--tmpfs rejects unsafe destinations"
+set +e
+OUT=$("$LGCR" run --tmpfs relative "$IMG" true 2>&1)
+RC=$?
+set -e
+expect_eq "$RC" "1" "invalid tmpfs rc"
+expect_contains "$OUT" "tmpfs destination must be an absolute container path" "invalid tmpfs error"
+
 rm -rf "$BIND_DIR"
 
 section "exec runs a command inside a running container"
