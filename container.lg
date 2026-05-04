@@ -44,6 +44,21 @@
   [{:dst "/tmp" :opts "mode=1777"}
    {:dst "/run" :opts "mode=0755"}])
 
+(def CURATED-DEV-NODES
+  [{:path "null"    :mode 0666 :major 1 :minor 3}
+   {:path "zero"    :mode 0666 :major 1 :minor 5}
+   {:path "full"    :mode 0666 :major 1 :minor 7}
+   {:path "random"  :mode 0666 :major 1 :minor 8}
+   {:path "urandom" :mode 0666 :major 1 :minor 9}
+   {:path "tty"     :mode 0666 :major 5 :minor 0}])
+
+(def CURATED-DEV-SYMLINKS
+  [{:target "pts/ptmx"      :path "ptmx"}
+   {:target "/proc/self/fd" :path "fd"}
+   {:target "/proc/self/fd/0" :path "stdin"}
+   {:target "/proc/self/fd/1" :path "stdout"}
+   {:target "/proc/self/fd/2" :path "stderr"}])
+
 ;; ---------------------------------------------------------------------------
 ;; state store (XDG-rooted, per-container dir)
 ;; ---------------------------------------------------------------------------
@@ -286,6 +301,37 @@
              (bit-or MS_REMOUNT sys/MS_RDONLY)
              ""))
 
+(defn create-dev-node [dev-dir {:keys [path mode major minor]}]
+  (sys/mknod (lib/path-join dev-dir path)
+             (bit-or sys/S_IFCHR mode)
+             major
+             minor))
+
+(defn create-dev-symlink [dev-dir {:keys [target path]}]
+  (sys/symlink target (lib/path-join dev-dir path)))
+
+(defn setup-devfs [merged]
+  (let [dev-dir (lib/path-join merged "dev")
+        pts-dir (lib/path-join dev-dir "pts")
+        shm-dir (lib/path-join dev-dir "shm")]
+    (sys/mkdir-p dev-dir 0755)
+    (sys/mount "tmpfs" dev-dir "tmpfs" 0 "mode=0755")
+    (sys/mkdir-p pts-dir 0755)
+    ;; Bind only /dev/pts from the host so externally allocated ptys still
+    ;; resolve to /dev/pts/N inside the container, without exposing host /dev.
+    (sys/mount "/dev/pts" pts-dir "none"
+               (bit-or sys/MS_BIND sys/MS_REC)
+               "")
+    (sys/mkdir-p shm-dir 01777)
+    (sys/mount "tmpfs" shm-dir "tmpfs"
+               (bit-or sys/MS_NOSUID
+                       (bit-or sys/MS_NODEV sys/MS_NOEXEC))
+               "mode=1777")
+    (doseq [node CURATED-DEV-NODES]
+      (create-dev-node dev-dir node))
+    (doseq [link CURATED-DEV-SYMLINKS]
+      (create-dev-symlink dev-dir link))))
+
 ;; ---------------------------------------------------------------------------
 ;; container init (runs inside namespaces)
 ;; ---------------------------------------------------------------------------
@@ -346,6 +392,48 @@
     (exists? (str "/usr/sbin/" cmd))  (str "/usr/sbin/" cmd)
     :else (die "command not found: " cmd)))
 
+(defn apparmor-enabled? []
+  (try
+    (let [path "/sys/module/apparmor/parameters/enabled"]
+      (and (exists? path)
+           (str/starts-with?
+             (str/upper-case (str/trim (slurp path)))
+             "Y")))
+    (catch e false)))
+
+(defn child-exec-payload [bin argv env caps seccomp apparmor-profile]
+  (json/write-json {:bin bin
+                    :argv (vec argv)
+                    :env (vec (or env []))
+                    :caps (vec (or caps lib/DEFAULT-CAPABILITY-NAMES))
+                    :seccomp (or seccomp "default")
+                    :apparmor-profile apparmor-profile}))
+
+(defn child-exec-argv [payload]
+  ["/proc/self/exe" "child-exec" payload])
+
+(defn do-child-exec [payload]
+  (let [{:keys [bin argv env caps seccomp apparmor-profile]}
+        (json/read-json payload {:keywords? true})
+        caps    (vec (or caps lib/DEFAULT-CAPABILITY-NAMES))
+        seccomp (or seccomp "default")]
+    (when apparmor-profile
+      (when-not (apparmor-enabled?)
+        (die "AppArmor is not available on this host"))
+      (try
+        (sys/apparmor-stack-onexec apparmor-profile)
+        (catch e
+          (die "AppArmor profile '" apparmor-profile "' could not be applied: " e))))
+    (when (= 0 (sys/getuid))
+      (doseq [cap (lib/bounding-drop-capabilities caps)]
+        (sys/prctl sys/PR_CAPBSET_DROP (lib/capability-number cap) 0 0 0))
+      (let [mask (lib/capability-mask caps)]
+        (sys/capset mask mask 0)))
+    (sys/prctl sys/PR_SET_NO_NEW_PRIVS 1 0 0 0)
+    (when (= seccomp "default")
+      (sys/seccomp-default))
+    (sys/exec bin (vec argv) (vec (or env [])))))
+
 ;; primary-pid and primary-exit-ch are per-init globals. Init creates an atom
 ;; and a chan at boot; handle-exec-conn uses them to wire the PRIMARY child
 ;; into the signal forwarder and signal init when that child exits.
@@ -362,20 +450,22 @@
   (try
     (let [msg     (unix/recv conn 32768 3)
           req     (json/read-json (:data msg) {:keywords? true})
-          {:keys [argv env tty workdir user primary]} req
+          {:keys [argv env tty workdir user primary caps seccomp apparmor-profile]} req
           fds     (:fds msg)
           stdin   (nth fds 0 nil)
           stdout  (nth fds 1 nil)
           stderr  (nth fds 2 nil)
           argv    (vec argv)
           bin     (resolve-bin (first argv))
+          payload (child-exec-payload bin argv env caps seccomp apparmor-profile)
+          cmdv    (child-exec-argv payload)
           creds   (resolve-user user)
           opts    (cond-> {}
                     tty                             (assoc :setctty? true)
                     creds                           (assoc :uid (:uid creds)
                                                            :gid (:gid creds))
                     (and workdir (not= "" workdir)) (assoc :dir workdir))
-          {:keys [pid]} (sys/spawn-async bin argv (vec (or env [])) 0
+          {:keys [pid]} (sys/spawn-async (first cmdv) cmdv (vec (or env [])) 0
                                              stdin stdout stderr
                                              (if (empty? opts) nil opts))
           wait-ch (async/chan 1)]
@@ -416,14 +506,13 @@
     (sys/mount merged merged "none" sys/MS_BIND "")
     ;; mount essential filesystems inside the new root
     (let [proc-dir (lib/path-join merged "proc")
-          sys-dir  (lib/path-join merged "sys")
-          dev-dir  (lib/path-join merged "dev")]
-      (sh! "mkdir" "-p" proc-dir sys-dir dev-dir)
+          sys-dir  (lib/path-join merged "sys")]
+      (sh! "mkdir" "-p" proc-dir sys-dir)
       (sys/mount "proc" proc-dir "proc" 0 "")
       (sys/mount "sysfs" sys-dir "sysfs" (bit-or sys/MS_NOSUID
                                                      (bit-or sys/MS_NOEXEC
                                                              sys/MS_NODEV)) "")
-      (sys/mount "/dev" dev-dir "none" (bit-or sys/MS_BIND sys/MS_REC) ""))
+      (setup-devfs merged))
     (apply-bind-mounts merged mounts)
     (when read-only?
       (mount-tmpfs-mounts merged READONLY-TMPFS-MOUNTS))
@@ -554,7 +643,7 @@
 
 (defn- primary-request
   "Build the :primary exec request from a container's state + stdio fds."
-  [{:keys [command args env env-image hostname workdir user]}]
+  [{:keys [command args env env-image hostname workdir user caps seccomp apparmor-profile]}]
   (let [img-env (lib/strip-nils (or env-image []))
         usr-env (lib/strip-nils (or env []))
         merged  (lib/merge-env img-env
@@ -566,7 +655,10 @@
      :argv    (into [command] (lib/strip-nils args))
      :env     (vec merged)
      :workdir workdir
-     :user    user}))
+     :user    user
+     :caps    (vec (or caps lib/DEFAULT-CAPABILITY-NAMES))
+     :seccomp (or seccomp "default")
+     :apparmor-profile apparmor-profile}))
 
 (defn- send-primary
   "Connect to init's ctrl.sock, send the :primary request with fds, and read
@@ -800,13 +892,17 @@
 ;; strip-nils + compose-command live in lib.lg
 
 (defn do-run [target user-cmd user-args
-              {:keys [detached? tty? rm? extra-env hostname workdir mounts tmpfs network read-only?] :as opts}]
+              {:keys [detached? tty? rm? extra-env hostname workdir mounts tmpfs network
+                      read-only? cap-add cap-drop seccomp apparmor] :as opts}]
   (let [{:keys [rootfs config]} (resolve-run-target target)
         [command args] (lib/compose-command config user-cmd user-args die)
         container-id (gen-id)
         hostname     (or hostname (str "lg-" (lib/short-id container-id)))
         mounts       (lib/parse-mount-specs mounts die)
         tmpfs-mounts (lib/parse-tmpfs-specs tmpfs die)
+        caps         (lib/resolve-capabilities cap-add cap-drop die)
+        seccomp      (lib/parse-seccomp-spec seccomp die)
+        apparmor     (lib/parse-apparmor-profile apparmor die)
         network      (lib/parse-network-spec network die)
         limits       (select-keys opts [:memory :cpu :pids])
         {cfg-workdir :workdir cfg-user :user cfg-env :env} config]
@@ -828,6 +924,9 @@
                     :user          (or cfg-user "")
                     :env-image     (or cfg-env [])
                     :env           (or extra-env [])
+                    :caps          caps
+                    :seccomp       seccomp
+                    :apparmor-profile apparmor
                     :mounts        mounts
                     :tmpfs-mounts  tmpfs-mounts
                     :network       network
@@ -1102,13 +1201,20 @@
           (try (unix/close conn) (catch e nil))
           (os/exit (if (> sg 0) (+ 128 sg) st)))))))
 
-(defn do-exec [id-prefix argv extra-env tty? user]
+(defn do-exec [id-prefix argv extra-env tty? user cap-add cap-drop seccomp-spec apparmor-spec]
   (when (< (count argv) 1)
-    (die "usage: lgcr exec [-it] [-e K=V]... [-u USER[:GROUP]] <id> <cmd> [args...]"))
+    (die "usage: lgcr exec [-it] [--seccomp default|unconfined] [--apparmor PROFILE|unconfined] [--cap-add CAP] [--cap-drop CAP] [-e K=V]... [-u USER[:GROUP]] <id> <cmd> [args...]"))
   (let [id    (require-id id-prefix)
         state (read-state id)
         {:keys [env-image env]} state
-        status (effective-status state)]
+        status (effective-status state)
+        caps   (lib/resolve-capabilities cap-add cap-drop die)
+        seccomp (if seccomp-spec
+                  (lib/parse-seccomp-spec seccomp-spec die)
+                  (or (:seccomp state) "default"))
+        apparmor-profile (if apparmor-spec
+                           (lib/parse-apparmor-profile apparmor-spec die)
+                           (:apparmor-profile state))]
     (when (not= status "running")
       (die "container " (lib/short-id id) " is not running (" status ")"))
     (let [sock (str (container-dir id) "/ctrl.sock")]
@@ -1117,7 +1223,11 @@
       (let [conn    (try (unix/connect sock) (catch e (die "connect " sock ": " e)))
             req-env (vec (lib/merge-env (or env-image [])
                                         (concat (or env []) (or extra-env []))))
-            req     (cond-> {:argv (vec argv) :env req-env}
+            req     (cond-> {:argv (vec argv)
+                             :env req-env
+                             :caps caps
+                             :seccomp seccomp
+                             :apparmor-profile apparmor-profile}
                       user (assoc :user user))]
         (if tty?
           (do-exec-tty conn req)
@@ -1472,6 +1582,10 @@
                             "-t"   [:tty?      :bool]
                             "-i"   [:_i        :ignore]
                             "-e"   [:extra-env :accumulate]
+                            "--seccomp" [:seccomp :value]
+                            "--apparmor" [:apparmor :value]
+                            "--cap-add" [:cap-add :accumulate]
+                            "--cap-drop" [:cap-drop :accumulate]
                             "-v"   [:mounts    :accumulate]
                             "--mount" [:mounts :accumulate]
                             "--tmpfs" [:tmpfs :accumulate]
@@ -1484,7 +1598,7 @@
                             "--hostname" [:hostname :value]}
                            tail)]
       (if (< (count rest-args) 1)
-        (die "usage: lgcr run [-d|-it] [--rm] [--read-only] [--net host|none|bridge] [--tmpfs DST[:opts]] [-e K=V]... [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image-or-rootfs> [command [args...]]")
+        (die "usage: lgcr run [-d|-it] [--rm] [--read-only] [--net host|none|bridge] [--tmpfs DST[:opts]] [--seccomp default|unconfined] [--apparmor PROFILE|unconfined] [--cap-add CAP] [--cap-drop CAP] [-e K=V]... [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image-or-rootfs> [command [args...]]")
         (do-run (first rest-args)
                 (second rest-args)       ;; nil if not given
                 (vec (drop 2 rest-args))
@@ -1536,13 +1650,19 @@
           (lib/parse-flags {"-e" [:extra-env :accumulate]
                             "-t" [:tty?      :bool]
                             "-i" [:_i        :ignore]
+                            "--seccomp" [:seccomp :value]
+                            "--apparmor" [:apparmor :value]
+                            "--cap-add" [:cap-add :accumulate]
+                            "--cap-drop" [:cap-drop :accumulate]
                             "-u" [:user      :value]
                             "--user" [:user  :value]}
                            tail)]
       (if (< (count rest-args) 2)
-        (die "usage: lgcr exec [-it] [-e K=V]... [-u USER[:GROUP]] <id> <cmd> [args...]")
+        (die "usage: lgcr exec [-it] [--seccomp default|unconfined] [--apparmor PROFILE|unconfined] [--cap-add CAP] [--cap-drop CAP] [-e K=V]... [-u USER[:GROUP]] <id> <cmd> [args...]")
         (do-exec (first rest-args) (vec (drop 1 rest-args))
-                 (:extra-env flags) (:tty? flags) (:user flags))))
+                 (:extra-env flags) (:tty? flags) (:user flags)
+                 (:cap-add flags) (:cap-drop flags)
+                 (:seccomp flags) (:apparmor flags))))
 
     (= subcmd "start")
     (if (< (count tail) 1)
@@ -1553,6 +1673,11 @@
     (if (< (count tail) 1)
       (die "usage: lgcr init <id>  (internal)")
       (do-init (first tail)))
+
+    (= subcmd "child-exec")
+    (if (< (count tail) 1)
+      (die "usage: lgcr child-exec <payload>  (internal)")
+      (do-child-exec (first tail)))
 
     (= subcmd "pull")
     (if (< (count tail) 1)
@@ -1583,7 +1708,7 @@
       (println "let-go container runtime")
       (println)
       (println "usage:")
-      (println "  lgcr run [-d] [--rm] [--read-only] [--net host|none|bridge] [--tmpfs DST[:opts]] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <rootfs-dir> <command> [args...]")
+      (println "  lgcr run [-d] [--rm] [--read-only] [--net host|none|bridge] [--tmpfs DST[:opts]] [--seccomp default|unconfined] [--apparmor PROFILE|unconfined] [--cap-add CAP] [--cap-drop CAP] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <rootfs-dir> <command> [args...]")
       (println "  lgcr ps [-a] [-q]")
       (println "  lgcr logs [-f] <id>")
       (println "  lgcr stop [-t SECS] <id>...")
@@ -1591,7 +1716,7 @@
       (println "  lgcr rm [-f] <id>...")
       (println "  lgcr start <id>...")
       (println "  lgcr inspect <id>")
-      (println "  lgcr exec [-it] [-e K=V] [-u USER[:GROUP]] <id> <cmd> [args...]")
+      (println "  lgcr exec [-it] [--seccomp default|unconfined] [--apparmor PROFILE|unconfined] [--cap-add CAP] [--cap-drop CAP] [-e K=V] [-u USER[:GROUP]] <id> <cmd> [args...]")
       (println "  lgcr pull <image>            (e.g. alpine:3.21)")
       (println "  lgcr images [-q]")
       (println "  lgcr rmi [-f] <image>...")

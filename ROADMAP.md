@@ -143,27 +143,24 @@ credential path as primary commands.
 Not optional long-term. A "container" that shares the host kernel without any
 of the defense-in-depth layers is a namespace trick, not isolation.
 
-- **Capabilities drop**: default to the Docker/containerd default set; expose
-  `--cap-add` / `--cap-drop`. Needs `prctl(PR_CAPBSET_DROP)` + `capset(2)` on
-  the init side — add to `syscall/`.
-- **`no_new_privs`**: `prctl(PR_SET_NO_NEW_PRIVS)` before exec. Prevents the
-  container command from gaining privileges via setuid binaries. Trivial to
-  implement, big win.
-- **Seccomp**: BPF-based syscall filtering. Default profile (the
-  Docker/containerd default is ~40 syscalls blocked) loaded via
-  `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ...)`. Needs a BPF program
-  representation; simplest is a fixed compiled default + user-supplied JSON
-  profile later.
+- **Capabilities drop — done**: default keep-set plus `--cap-add` /
+  `--cap-drop`, implemented via `prctl(PR_CAPBSET_DROP)` + `capset(2)` in the
+  child just before exec.
+- **`no_new_privs` — done**: `prctl(PR_SET_NO_NEW_PRIVS)` is applied before
+  the final exec for both `run` primaries and `exec` sessions.
+- **Seccomp — done (default profile)**: a built-in BPF filter is now loaded by
+  default before exec; `--seccomp unconfined` disables it per-process. JSON
+  profile import is still future work.
 - **Read-only rootfs — done**: `--read-only` flag; remounts the merged rootfs
   MS_RDONLY plus tmpfs mounts for `/tmp` and `/run`.
 - **Rootless mode**: user namespaces with uid_map/gid_map. Lets non-root users
   run containers. Requires significant work: subuid/subgid parsing, userns
   cloneflag, newuidmap/newgidmap helpers (or direct `/proc/.../uid_map` writes).
-- **AppArmor / SELinux labels**: apply a default profile when the host has one
-  loaded. Probably deferred until real deployment demand.
-- Minor but worth it: `/dev` should be a curated tmpfs with only
-  null/zero/full/random/urandom/tty/ptmx (currently we bind-mount host /dev,
-  which leaks device access).
+- **AppArmor / SELinux labels**: `--apparmor PROFILE` is now wired through to
+  the exec boundary, but automatic default labeling remains deferred until
+  there is real host-policy demand.
+- **Curated `/dev` — done**: tmpfs-backed `/dev`, a small device set, `/dev/shm`,
+  and a narrowed `/dev/pts` mount replace the old host `/dev` bind-mount.
 
 ## M5 — networking
 

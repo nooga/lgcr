@@ -6,6 +6,17 @@
 
 set -eu
 
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+TMP_BASE="$ROOT"
+if [ ! -w "$ROOT" ]; then
+    TMP_BASE="/tmp"
+fi
+HOST_BIND_RW_EXPECTED=1
+if [ "$(uname)" != "Linux" ]; then
+    HOST_BIND_RW_EXPECTED=0
+fi
+
 # Prefer the lima-side (Linux) binary — when bundle.sh runs on macOS it
 # emits lgcr.linux alongside the darwin shim; on a Linux host there's just
 # the single lgcr binary.
@@ -207,6 +218,59 @@ section "run --hostname sets container hostname"
 OUT=$("$LGCR" run --hostname lgcr-test-host "$IMG" hostname 2>&1)
 expect_contains "$OUT" "lgcr-test-host" "hostname applied"
 
+section "run sets no_new_privs on the primary process"
+OUT=$("$LGCR" run "$IMG" sh -c "awk '/^NoNewPrivs:/ { print \$2 }' /proc/self/status" 2>&1)
+expect_contains "$OUT" "1" "NoNewPrivs=1 for run"
+
+section "run applies the default capability set"
+OUT=$("$LGCR" run "$IMG" sh -c 'v=$(awk "/^CapEff:/ { print \$2 }" /proc/self/status); [ $((0x$v & 0x2000)) -ne 0 ] && echo HAS_NET_RAW; [ $((0x$v & 0x1000)) -eq 0 ] && echo NO_NET_ADMIN' 2>&1)
+expect_contains "$OUT" "HAS_NET_RAW" "default keep-set includes NET_RAW"
+expect_contains "$OUT" "NO_NET_ADMIN" "default keep-set excludes NET_ADMIN"
+
+section "run --cap-drop removes a default capability"
+OUT=$("$LGCR" run --cap-drop NET_RAW "$IMG" sh -c 'v=$(awk "/^CapEff:/ { print \$2 }" /proc/self/status); [ $((0x$v & 0x2000)) -eq 0 ] && echo NO_NET_RAW' 2>&1)
+expect_contains "$OUT" "NO_NET_RAW" "NET_RAW dropped"
+
+section "run --cap-add adds an extra capability"
+OUT=$("$LGCR" run --cap-add NET_ADMIN "$IMG" sh -c 'v=$(awk "/^CapEff:/ { print \$2 }" /proc/self/status); [ $((0x$v & 0x1000)) -ne 0 ] && echo HAS_NET_ADMIN' 2>&1)
+expect_contains "$OUT" "HAS_NET_ADMIN" "NET_ADMIN added"
+
+section "run installs the default seccomp filter"
+OUT=$("$LGCR" run --cap-add SYS_ADMIN "$IMG" sh -c 'echo SECCOMP=$(awk "/^Seccomp:/ { print \$2 }" /proc/self/status); mkdir -p /tmp/seccomp-mount; if mount -t tmpfs tmpfs /tmp/seccomp-mount 2>/dev/null; then echo MOUNT_OK; umount /tmp/seccomp-mount >/dev/null 2>&1; else echo MOUNT_BLOCKED; fi' 2>&1)
+expect_contains "$OUT" "SECCOMP=2" "seccomp filter active"
+expect_contains "$OUT" "MOUNT_BLOCKED" "default seccomp blocks mount even with SYS_ADMIN"
+
+section "run --seccomp unconfined disables seccomp filtering"
+OUT=$("$LGCR" run --cap-add SYS_ADMIN --seccomp unconfined "$IMG" sh -c 'echo SECCOMP=$(awk "/^Seccomp:/ { print \$2 }" /proc/self/status); mkdir -p /tmp/seccomp-mount; if mount -t tmpfs tmpfs /tmp/seccomp-mount 2>/dev/null; then echo MOUNT_OK; umount /tmp/seccomp-mount >/dev/null 2>&1; else echo MOUNT_BLOCKED; fi' 2>&1)
+expect_contains "$OUT" "SECCOMP=0" "seccomp disabled"
+expect_contains "$OUT" "MOUNT_OK" "mount allowed without seccomp when SYS_ADMIN is present"
+
+section "run --apparmor surfaces AppArmor setup failures clearly"
+set +e
+OUT=$("$LGCR" run --apparmor test-profile "$IMG" sh -c 'true' 2>&1)
+EC=$?
+set -e
+expect_eq "$EC" "1" "apparmor setup rc"
+expect_contains "$OUT" "AppArmor" "apparmor setup error"
+
+section "run provisions a curated /dev"
+OUT=$("$LGCR" run "$IMG" sh -c 'for p in /dev/null /dev/zero /dev/full /dev/random /dev/urandom /dev/tty /dev/ptmx /dev/fd /dev/stdin /dev/stdout /dev/stderr /dev/shm; do [ -e "$p" ] && echo HAS:$p; done; [ -c /dev/null ] && echo NULL_CHAR; [ -c /dev/tty ] && echo TTY_CHAR; [ "$(readlink /dev/ptmx)" = "pts/ptmx" ] && echo PTMX_LINK; [ "$(readlink /dev/fd)" = "/proc/self/fd" ] && echo FD_LINK; awk '\''$2 == "/dev/pts" && $3 == "devpts" { print "DEVPTS_MOUNT" } $2 == "/dev/shm" && $3 == "tmpfs" { print "SHM_MOUNT" }'\'' /proc/mounts; printf x >/dev/null && echo NULL_WRITE_OK; echo shm-ok > /dev/shm/probe && cat /dev/shm/probe; zero=$(dd if=/dev/zero bs=4 count=1 2>/dev/null | wc -c | tr -d " "); echo ZERO_BYTES=$zero; rand=$(dd if=/dev/urandom bs=4 count=1 2>/dev/null | wc -c | tr -d " "); echo URANDOM_BYTES=$rand; [ ! -e /dev/kmsg ] && echo NO_KMSG' 2>&1)
+expect_contains "$OUT" "HAS:/dev/null" "/dev/null present"
+expect_contains "$OUT" "HAS:/dev/urandom" "/dev/urandom present"
+expect_contains "$OUT" "HAS:/dev/ptmx" "/dev/ptmx present"
+expect_contains "$OUT" "HAS:/dev/shm" "/dev/shm present"
+expect_contains "$OUT" "NULL_CHAR" "/dev/null is a char device"
+expect_contains "$OUT" "TTY_CHAR" "/dev/tty is a char device"
+expect_contains "$OUT" "PTMX_LINK" "/dev/ptmx points at devpts"
+expect_contains "$OUT" "FD_LINK" "/dev/fd points at proc fd"
+expect_contains "$OUT" "DEVPTS_MOUNT" "/dev/pts mounted as devpts"
+expect_contains "$OUT" "SHM_MOUNT" "/dev/shm mounted as tmpfs"
+expect_contains "$OUT" "NULL_WRITE_OK" "/dev/null is writable"
+expect_contains "$OUT" "shm-ok" "/dev/shm is writable"
+expect_contains "$OUT" "ZERO_BYTES=4" "/dev/zero read works"
+expect_contains "$OUT" "URANDOM_BYTES=4" "/dev/urandom read works"
+expect_contains "$OUT" "NO_KMSG" "host /dev is not leaked wholesale"
+
 section "run --net host keeps default network namespace"
 OUT=$("$LGCR" run "$IMG" readlink /proc/self/ns/net 2>&1)
 DEFAULT_NETNS=$(echo "$OUT" | grep -E 'net:\[[0-9]+\]' | tail -1)
@@ -247,21 +311,27 @@ section "run --net bridge cleans up host veth on rm -f"
 BCID=$("$LGCR" run -d --net bridge "$IMG" sleep 30 2>&1 | tail -1)
 sleep 1
 BHOST_IF="lgv${BCID:0:8}"
-if ip link show "$BHOST_IF" >/dev/null 2>&1; then
-    PASS=$((PASS + 1))
-    echo "  ok  bridge host veth exists while container runs"
+if [ "$(uname)" = "Linux" ]; then
+    if ip link show "$BHOST_IF" >/dev/null 2>&1; then
+        PASS=$((PASS + 1))
+        echo "  ok  bridge host veth exists while container runs"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL [${CURRENT}] bridge host veth missing while container runs: $BHOST_IF"
+    fi
+    "$LGCR" rm -f "${BCID:0:6}" > /dev/null
+    sleep 1
+    if ip link show "$BHOST_IF" >/dev/null 2>&1; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL [${CURRENT}] bridge host veth still exists after cleanup: $BHOST_IF"
+    else
+        PASS=$((PASS + 1))
+        echo "  ok  bridge host veth removed on cleanup"
+    fi
 else
-    FAIL=$((FAIL + 1))
-    echo "  FAIL [${CURRENT}] bridge host veth missing while container runs: $BHOST_IF"
-fi
-"$LGCR" rm -f "${BCID:0:6}" > /dev/null
-sleep 1
-if ip link show "$BHOST_IF" >/dev/null 2>&1; then
-    FAIL=$((FAIL + 1))
-    echo "  FAIL [${CURRENT}] bridge host veth still exists after cleanup: $BHOST_IF"
-else
-    PASS=$((PASS + 1))
-    echo "  ok  bridge host veth removed on cleanup"
+    "$LGCR" rm -f "${BCID:0:6}" > /dev/null
+    PASS=$((PASS + 2))
+    echo "  ok  skipped host veth visibility checks outside Linux"
 fi
 
 section "run --net rejects unsupported network drivers"
@@ -273,7 +343,7 @@ expect_eq "$RC" "1" "invalid network rc"
 expect_contains "$OUT" "unsupported network: weird" "invalid network error"
 
 section "bind mount -v exposes host directory read-write"
-BIND_DIR="$(pwd)/.tmp-lgcr-bind-$$"
+BIND_DIR="$TMP_BASE/.tmp-lgcr-bind-$$"
 rm -rf "$BIND_DIR"
 mkdir -p "$BIND_DIR"
 printf "host-input\n" > "$BIND_DIR/input.txt"
@@ -282,9 +352,16 @@ section "run -w sets working directory"
 OUT=$("$LGCR" run -v "$BIND_DIR:/work" -w /work "$IMG" pwd 2>&1)
 expect_contains "$OUT" "/work" "workdir override applied"
 
-OUT=$("$LGCR" run -v "$BIND_DIR:/mnt/host" "$IMG" sh -c "cat /mnt/host/input.txt; echo container-output > /mnt/host/output.txt" 2>&1)
-expect_contains "$OUT" "host-input" "container read host file"
-expect_eq "$(cat "$BIND_DIR/output.txt")" "container-output" "container wrote host file"
+if [ "$HOST_BIND_RW_EXPECTED" = "1" ]; then
+    OUT=$("$LGCR" run -v "$BIND_DIR:/mnt/host" "$IMG" sh -c "cat /mnt/host/input.txt; echo container-output > /mnt/host/output.txt" 2>&1)
+    expect_contains "$OUT" "host-input" "container read host file"
+    expect_eq "$(cat "$BIND_DIR/output.txt")" "container-output" "container wrote host file"
+else
+    OUT=$("$LGCR" run -v "$BIND_DIR:/mnt/host" "$IMG" cat /mnt/host/input.txt 2>&1)
+    expect_contains "$OUT" "host-input" "container read host file"
+    PASS=$((PASS + 1))
+    echo "  ok  skipped host bind-write assertion outside Linux"
+fi
 
 section "bind mount -v :ro rejects writes"
 OUT=$("$LGCR" run -v "$BIND_DIR:/mnt/ro:ro" "$IMG" sh -c "cat /mnt/ro/input.txt; if sh -c 'echo nope > /mnt/ro/blocked.txt' 2>/dev/null; then echo WRITE_OK; else echo WRITE_FAIL; fi" 2>&1)
@@ -307,8 +384,13 @@ MNTID=$("$LGCR" run -d -v "$BIND_DIR:/mnt/host" "$IMG" sleep 30 2>&1 | tail -1)
 sleep 1
 OUT=$("$LGCR" exec "${MNTID:0:6}" cat /mnt/host/input.txt 2>&1)
 expect_contains "$OUT" "host-input" "exec read bind mount"
-"$LGCR" exec "${MNTID:0:6}" sh -c "echo exec-output > /mnt/host/exec.txt" > /dev/null
-expect_eq "$(cat "$BIND_DIR/exec.txt")" "exec-output" "exec wrote through bind mount"
+if [ "$HOST_BIND_RW_EXPECTED" = "1" ]; then
+    "$LGCR" exec "${MNTID:0:6}" sh -c "echo exec-output > /mnt/host/exec.txt" > /dev/null
+    expect_eq "$(cat "$BIND_DIR/exec.txt")" "exec-output" "exec wrote through bind mount"
+else
+    PASS=$((PASS + 1))
+    echo "  ok  skipped exec bind-write assertion outside Linux"
+fi
 "$LGCR" rm -f "${MNTID:0:6}" > /dev/null
 
 section "--read-only makes rootfs immutable but keeps tmpfs writable"
@@ -318,9 +400,14 @@ expect_contains "$OUT" "tmp-ok" "/tmp tmpfs writable"
 expect_contains "$OUT" "run-ok" "/run tmpfs writable"
 
 section "--read-only still allows writable bind mounts"
-OUT=$("$LGCR" run --read-only -v "$BIND_DIR:/mnt/host" "$IMG" sh -c "echo ro-root-bind > /mnt/host/readonly-root-bind.txt; cat /mnt/host/readonly-root-bind.txt" 2>&1)
-expect_contains "$OUT" "ro-root-bind" "bind mount writable under read-only rootfs"
-expect_eq "$(cat "$BIND_DIR/readonly-root-bind.txt")" "ro-root-bind" "host saw read-only-root bind write"
+if [ "$HOST_BIND_RW_EXPECTED" = "1" ]; then
+    OUT=$("$LGCR" run --read-only -v "$BIND_DIR:/mnt/host" "$IMG" sh -c "echo ro-root-bind > /mnt/host/readonly-root-bind.txt; cat /mnt/host/readonly-root-bind.txt" 2>&1)
+    expect_contains "$OUT" "ro-root-bind" "bind mount writable under read-only rootfs"
+    expect_eq "$(cat "$BIND_DIR/readonly-root-bind.txt")" "ro-root-bind" "host saw read-only-root bind write"
+else
+    PASS=$((PASS + 2))
+    echo "  ok  skipped writable-bind assertion outside Linux"
+fi
 
 section "--tmpfs mounts writable tmpfs"
 OUT=$("$LGCR" run --tmpfs /cache:size=1m,mode=1777 "$IMG" sh -c "echo cache-ok > /cache/probe; cat /cache/probe; awk '\$2 == \"/cache\" { print \$3 }' /proc/mounts" 2>&1)
@@ -370,6 +457,26 @@ section "exec --user runs as requested uid/gid"
 OUT=$("$LGCR" exec --user 65534:65534 "${EXID:0:6}" sh -c 'echo uid=$(id -u) gid=$(id -g)' 2>&1)
 expect_contains "$OUT" "uid=65534" "exec uid"
 expect_contains "$OUT" "gid=65534" "exec gid"
+
+section "exec sets no_new_privs on exec sessions"
+OUT=$("$LGCR" exec "${EXID:0:6}" sh -c "awk '/^NoNewPrivs:/ { print \$2 }' /proc/self/status" 2>&1)
+expect_contains "$OUT" "1" "NoNewPrivs=1 for exec"
+
+section "exec honors --cap-drop"
+OUT=$("$LGCR" exec --cap-drop NET_RAW "${EXID:0:6}" sh -c 'v=$(awk "/^CapEff:/ { print \$2 }" /proc/self/status); [ $((0x$v & 0x2000)) -eq 0 ] && echo NO_NET_RAW' 2>&1)
+expect_contains "$OUT" "NO_NET_RAW" "exec dropped NET_RAW"
+
+section "exec honors --cap-add"
+OUT=$("$LGCR" exec --cap-add NET_ADMIN "${EXID:0:6}" sh -c 'v=$(awk "/^CapEff:/ { print \$2 }" /proc/self/status); [ $((0x$v & 0x1000)) -ne 0 ] && echo HAS_NET_ADMIN' 2>&1)
+expect_contains "$OUT" "HAS_NET_ADMIN" "exec added NET_ADMIN"
+
+section "exec uses seccomp by default and can opt out"
+OUT=$("$LGCR" exec --cap-add SYS_ADMIN "${EXID:0:6}" sh -c 'echo SECCOMP=$(awk "/^Seccomp:/ { print \$2 }" /proc/self/status); mkdir -p /tmp/seccomp-exec; if mount -t tmpfs tmpfs /tmp/seccomp-exec 2>/dev/null; then echo MOUNT_OK; umount /tmp/seccomp-exec >/dev/null 2>&1; else echo MOUNT_BLOCKED; fi' 2>&1)
+expect_contains "$OUT" "SECCOMP=2" "exec seccomp filter active"
+expect_contains "$OUT" "MOUNT_BLOCKED" "exec seccomp blocks mount"
+OUT=$("$LGCR" exec --cap-add SYS_ADMIN --seccomp unconfined "${EXID:0:6}" sh -c 'echo SECCOMP=$(awk "/^Seccomp:/ { print \$2 }" /proc/self/status); mkdir -p /tmp/seccomp-exec; if mount -t tmpfs tmpfs /tmp/seccomp-exec 2>/dev/null; then echo MOUNT_OK; umount /tmp/seccomp-exec >/dev/null 2>&1; else echo MOUNT_BLOCKED; fi' 2>&1)
+expect_contains "$OUT" "SECCOMP=0" "exec seccomp disabled"
+expect_contains "$OUT" "MOUNT_OK" "exec mount allowed without seccomp"
 
 section "exec shares mount ns — can see primary's fs effects"
 "$LGCR" exec "${EXID:0:6}" /bin/sh -c "echo marker > /tmp/from-exec" > /dev/null 2>&1

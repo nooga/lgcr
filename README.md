@@ -149,8 +149,8 @@ lgcr exec "$cid" sh -c 'ls /proc | head'
 See [ROADMAP.md](./ROADMAP.md) for the plan. Short version:
 
 - No published ports yet; bridge networking provides isolated outbound connectivity, but there is still no `-p`/port-forwarding support (M5)
-- No capability drop, seccomp, `no_new_privs` — unprivileged workloads only (M4)
 - No rootless user namespaces (M4)
+- No default AppArmor / SELinux labeling yet; `--apparmor PROFILE` is supported, but host-default labeling is still deferred (M4)
 - No image build (M7 — a Lisp-macro DSL called `defcontainer` is planned)
 - No content-addressable image store — each image ref gets its own flat
   rootfs under `$XDG_DATA_HOME/lgcr/images/` (temporary; M8 replaces this

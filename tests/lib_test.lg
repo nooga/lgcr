@@ -254,6 +254,24 @@
          (lib/parse-network-spec "bridge" throw-err))))
 
 ;; ---------------------------------------------------------------------------
+;; security parsing
+;; ---------------------------------------------------------------------------
+
+(deftest parse-seccomp-spec-defaults-to-default
+  (is (= "default" (lib/parse-seccomp-spec nil throw-err))))
+
+(deftest parse-seccomp-spec-known-values
+  (is (= "default" (lib/parse-seccomp-spec "default" throw-err)))
+  (is (= "unconfined" (lib/parse-seccomp-spec "unconfined" throw-err))))
+
+(deftest parse-apparmor-profile-defaults-to-nil
+  (is (= nil (lib/parse-apparmor-profile nil throw-err))))
+
+(deftest parse-apparmor-profile-known-values
+  (is (= nil (lib/parse-apparmor-profile "unconfined" throw-err)))
+  (is (= "profile-name" (lib/parse-apparmor-profile "profile-name" throw-err))))
+
+;; ---------------------------------------------------------------------------
 ;; parse-signal
 ;; ---------------------------------------------------------------------------
 
@@ -269,6 +287,33 @@
 
 (deftest parse-signal-accepts-numbers
   (is (= 7 (lib/parse-signal "7" throw-err))))
+
+;; ---------------------------------------------------------------------------
+;; capabilities
+;; ---------------------------------------------------------------------------
+
+(deftest parse-capability-normalizes-prefix
+  (is (= "NET_ADMIN" (lib/parse-capability "NET_ADMIN" throw-err)))
+  (is (= "NET_ADMIN" (lib/parse-capability "cap_net_admin" throw-err)))
+  (is (= "ALL" (lib/parse-capability "all" throw-err))))
+
+(deftest resolve-capabilities-default-add-drop
+  (let [base (lib/resolve-capabilities nil nil throw-err)]
+    (is (= true  (lib/vector-contains? base "NET_RAW")))
+    (is (= false (lib/vector-contains? base "NET_ADMIN"))))
+  (let [caps (lib/resolve-capabilities ["NET_ADMIN"] ["NET_RAW"] throw-err)]
+    (is (= true  (lib/vector-contains? caps "NET_ADMIN")))
+    (is (= false (lib/vector-contains? caps "NET_RAW")))))
+
+(deftest resolve-capabilities-all-and-bounding-drops
+  (is (= ["NET_BIND_SERVICE"]
+         (lib/resolve-capabilities ["NET_BIND_SERVICE"] ["ALL"] throw-err)))
+  (let [drops (lib/bounding-drop-capabilities [])]
+    (is (= "SETPCAP" (last drops)))
+    (is (= true (lib/vector-contains? drops "CHOWN")))))
+
+(deftest capability-mask-combines-bits
+  (is (= 8193 (lib/capability-mask ["CHOWN" "NET_RAW"]))))
 
 ;; ---------------------------------------------------------------------------
 ;; humanize-ago

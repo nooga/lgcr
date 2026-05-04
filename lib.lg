@@ -267,6 +267,28 @@
       :else (on-err (str "unsupported network: " spec)))))
 
 ;; ---------------------------------------------------------------------------
+;; security parsing
+;; ---------------------------------------------------------------------------
+
+(defn parse-seccomp-spec
+  "Parse --seccomp. Nil defaults to the built-in profile."
+  [spec on-err]
+  (let [spec (or spec "default")]
+    (cond
+      (= spec "default") "default"
+      (= spec "unconfined") "unconfined"
+      :else (on-err (str "unsupported seccomp profile: " spec)))))
+
+(defn parse-apparmor-profile
+  "Parse --apparmor. Nil or 'unconfined' disable AppArmor."
+  [spec on-err]
+  (cond
+    (nil? spec) nil
+    (= spec "") (on-err "apparmor profile must not be empty")
+    (= spec "unconfined") nil
+    :else spec))
+
+;; ---------------------------------------------------------------------------
 ;; env helpers
 ;; ---------------------------------------------------------------------------
 
@@ -372,6 +394,135 @@
     (get SIGNAL-NUMBERS s) (get SIGNAL-NUMBERS s)
     :else (let [n (try (parse-int s) (catch e nil))]
             (or n (on-err (str "unknown signal: " s))))))
+
+;; ---------------------------------------------------------------------------
+;; capabilities
+;; ---------------------------------------------------------------------------
+
+(def ALL-CAPABILITY-NAMES
+  ["CHOWN" "DAC_OVERRIDE" "DAC_READ_SEARCH" "FOWNER" "FSETID" "KILL"
+   "SETGID" "SETUID" "SETPCAP" "LINUX_IMMUTABLE" "NET_BIND_SERVICE"
+   "NET_BROADCAST" "NET_ADMIN" "NET_RAW" "IPC_LOCK" "IPC_OWNER"
+   "SYS_MODULE" "SYS_RAWIO" "SYS_CHROOT" "SYS_PTRACE" "SYS_PACCT"
+   "SYS_ADMIN" "SYS_BOOT" "SYS_NICE" "SYS_RESOURCE" "SYS_TIME"
+   "SYS_TTY_CONFIG" "MKNOD" "LEASE" "AUDIT_WRITE" "AUDIT_CONTROL"
+   "SETFCAP" "MAC_OVERRIDE" "MAC_ADMIN" "SYSLOG" "WAKE_ALARM"
+   "BLOCK_SUSPEND" "AUDIT_READ" "PERFMON" "BPF" "CHECKPOINT_RESTORE"])
+
+(def CAPABILITY-NUMBERS
+  {"CHOWN" 0
+   "DAC_OVERRIDE" 1
+   "DAC_READ_SEARCH" 2
+   "FOWNER" 3
+   "FSETID" 4
+   "KILL" 5
+   "SETGID" 6
+   "SETUID" 7
+   "SETPCAP" 8
+   "LINUX_IMMUTABLE" 9
+   "NET_BIND_SERVICE" 10
+   "NET_BROADCAST" 11
+   "NET_ADMIN" 12
+   "NET_RAW" 13
+   "IPC_LOCK" 14
+   "IPC_OWNER" 15
+   "SYS_MODULE" 16
+   "SYS_RAWIO" 17
+   "SYS_CHROOT" 18
+   "SYS_PTRACE" 19
+   "SYS_PACCT" 20
+   "SYS_ADMIN" 21
+   "SYS_BOOT" 22
+   "SYS_NICE" 23
+   "SYS_RESOURCE" 24
+   "SYS_TIME" 25
+   "SYS_TTY_CONFIG" 26
+   "MKNOD" 27
+   "LEASE" 28
+   "AUDIT_WRITE" 29
+   "AUDIT_CONTROL" 30
+   "SETFCAP" 31
+   "MAC_OVERRIDE" 32
+   "MAC_ADMIN" 33
+   "SYSLOG" 34
+   "WAKE_ALARM" 35
+   "BLOCK_SUSPEND" 36
+   "AUDIT_READ" 37
+   "PERFMON" 38
+   "BPF" 39
+   "CHECKPOINT_RESTORE" 40})
+
+(def DEFAULT-CAPABILITY-NAMES
+  ["AUDIT_WRITE" "CHOWN" "DAC_OVERRIDE" "FOWNER" "FSETID" "KILL"
+   "MKNOD" "NET_BIND_SERVICE" "NET_RAW" "SETFCAP" "SETGID"
+   "SETPCAP" "SETUID" "SYS_CHROOT"])
+
+(defn vector-contains? [xs x]
+  (reduce (fn [acc v] (or acc (= v x))) false (or xs [])))
+
+(defn without-value [xs x]
+  (reduce (fn [acc v] (if (= v x) acc (conj acc v))) [] (or xs [])))
+
+(defn normalize-capability-name [s]
+  (let [u (str/upper-case s)]
+    (if (str/starts-with? u "CAP_")
+      (subs u 4)
+      u)))
+
+(defn parse-capability
+  "Normalize a capability spec. Accepts NAME, CAP_NAME, or ALL."
+  [s on-err]
+  (let [name (normalize-capability-name s)]
+    (cond
+      (= name "ALL") "ALL"
+      (get CAPABILITY-NUMBERS name) name
+      :else (on-err (str "unknown capability: " s)))))
+
+(defn resolve-capabilities
+  "Apply Docker-style cap add/drop semantics against the default keep-set."
+  [add-specs drop-specs on-err]
+  (let [adds      (mapv #(parse-capability % on-err) (or add-specs []))
+        drops     (mapv #(parse-capability % on-err) (or drop-specs []))
+        add-all?  (vector-contains? adds "ALL")
+        drop-all? (vector-contains? drops "ALL")
+        add-names (without-value adds "ALL")
+        drop-names (without-value drops "ALL")
+        base?     (fn [cap]
+                    (cond
+                      add-all? true
+                      drop-all? false
+                      :else (vector-contains? DEFAULT-CAPABILITY-NAMES cap)))]
+    (reduce (fn [acc cap]
+              (if (or (vector-contains? add-names cap)
+                      (and (base? cap) (not (vector-contains? drop-names cap))))
+                (conj acc cap)
+                acc))
+            []
+            ALL-CAPABILITY-NAMES)))
+
+(defn capability-number [name]
+  (get CAPABILITY-NUMBERS name))
+
+(defn capability-mask [caps]
+  (reduce (fn [mask name]
+            (bit-or mask (bit-shift-left 1 (capability-number name))))
+          0
+          (or caps [])))
+
+(defn bounding-drop-capabilities
+  "Capabilities to remove from the bounding set for a final keep-set.
+   CAP_SETPCAP is dropped last so it stays available for earlier drops."
+  [caps]
+  (let [drops (reduce (fn [acc cap]
+                        (if (vector-contains? caps cap)
+                          acc
+                          (conj acc cap)))
+                      []
+                      ALL-CAPABILITY-NAMES)
+        no-setpcap (without-value drops "SETPCAP")]
+    (if (vector-contains? drops "SETPCAP")
+      (conj no-setpcap "SETPCAP")
+      no-setpcap)))
 
 ;; ---------------------------------------------------------------------------
 ;; time formatting
