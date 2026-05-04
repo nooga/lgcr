@@ -168,10 +168,10 @@ The biggest optional chunk. Order of increasing cost:
 
 - `--net=host` / `--net=none` — done. Implemented through `net.lg`
   multimethod drivers so later bridge/container drivers have the same shape.
-- Bridge networking — mostly done: veth pair, host-side bridge, NAT, static
-  IPAM, and `-p HOSTPORT:CONTPORT` publishing via iptables rules are in.
-  The remaining networking gap is loopback-host publishing (`127.0.0.1`)
-  and any broader UX expansion beyond the current TCP-only host-port form.
+- Bridge networking — done for the current scope: veth pair, host-side bridge,
+  NAT, static IPAM, and `-p HOSTPORT:CONTPORT` publishing via iptables rules,
+  including host-address and `127.0.0.1` reachability. The remaining gaps are
+  UX expansion beyond the current TCP-only host-port form.
 - Defer until actual use cases drive the direction — "every container needs
   its own IP" and "containers just need the internet" want different designs.
 

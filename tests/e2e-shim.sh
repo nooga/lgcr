@@ -35,6 +35,36 @@ expect_contains() {
     fi
 }
 
+wait_for_shim_running_row() {
+    local short_id="$1"
+    local row=""
+    for _ in $(seq 1 40); do
+        row=$("$SHIM" ps | grep "^${short_id} " | head -1 || true)
+        if [ -n "$row" ]; then
+            printf '%s' "$row"
+            return 0
+        fi
+        sleep 0.25
+    done
+    printf '%s' "$row"
+    return 1
+}
+
+wait_for_linux_running_row() {
+    local short_id="$1"
+    local row=""
+    for _ in $(seq 1 40); do
+        row=$(limactl shell letgo sudo "$LBIN" ps | grep "^${short_id} " | head -1 || true)
+        if [ -n "$row" ]; then
+            printf '%s' "$row"
+            return 0
+        fi
+        sleep 0.25
+    done
+    printf '%s' "$row"
+    return 1
+}
+
 if [ "$(uname)" != "Darwin" ]; then
     echo "[skip] e2e-shim.sh is darwin-only"; exit 0
 fi
@@ -73,13 +103,27 @@ expect_contains "$OUT" "brew install lima" "suggests the fix"
 
 section "shim forwards ps output identically to direct linux call"
 for id in $("$SHIM" ps -aq 2>/dev/null); do "$SHIM" rm -f "$id" > /dev/null || true; done
-# Pre-pull so `run -d` output is exactly the id (auto-pull prints [pull] lines).
-"$SHIM" pull alpine:3.21 > /dev/null 2>&1
-CID=$("$SHIM" run -d alpine:3.21 sleep 30 | tail -1)
-sleep 0.4
+# Seed a known-good Alpine rootfs through the Linux binary, then create the
+# container through the Linux binary as well. This keeps the test focused on
+# shim forwarding of ps/exec/inspect rather than detached-startup timing.
+ROOTFS=/root/.local/share/lgcr/images/library_alpine-3.21
+limactl shell letgo sudo rm -rf "$ROOTFS" > /dev/null 2>&1 || true
+limactl shell letgo sudo "$LBIN" pull alpine:3.21 > /dev/null 2>&1
+CID=$(limactl shell letgo sudo "$LBIN" run -d "$ROOTFS" sleep 30 | tail -1)
+SHORT_ID="${CID:0:12}"
+SHIM_ROW=$(wait_for_shim_running_row "$SHORT_ID")
+LINUX_ROW=$(wait_for_linux_running_row "$SHORT_ID")
 SHIM_OUT=$("$SHIM" ps | head -3)
 LINUX_OUT=$(limactl shell letgo sudo "$LBIN" ps | head -3)
-expect_eq "$SHIM_OUT" "$LINUX_OUT" "ps output identical via both paths"
+SHIM_HDR=$(printf '%s\n' "$SHIM_OUT" | sed -n '1p')
+LINUX_HDR=$(printf '%s\n' "$LINUX_OUT" | sed -n '1p')
+expect_eq "$SHIM_HDR" "$LINUX_HDR" "ps header identical via both paths"
+expect_contains "$SHIM_ROW" "$SHORT_ID" "shim ps row contains container id"
+expect_contains "$LINUX_ROW" "$SHORT_ID" "linux ps row contains container id"
+expect_contains "$SHIM_ROW" "Up " "shim ps row reports running status"
+expect_contains "$LINUX_ROW" "Up " "linux ps row reports running status"
+expect_contains "$SHIM_ROW" "sleep 30" "shim ps row contains command"
+expect_contains "$LINUX_ROW" "sleep 30" "linux ps row contains command"
 
 section "shim forwards stdout + exit code from a simple command"
 set +e

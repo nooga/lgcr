@@ -148,7 +148,7 @@ lgcr exec "$cid" sh -c 'ls /proc | head'
 
 See [ROADMAP.md](./ROADMAP.md) for the plan. Short version:
 
-- Bridge port publishing is implemented for `--net bridge` via `-p HOSTPORT:CONTPORT`; published ports are reachable on the host's non-loopback addresses, but `127.0.0.1` loopback publishing is not wired yet (M5)
+- Bridge port publishing is implemented for `--net bridge` via `-p HOSTPORT:CONTPORT`, including reachability via both the host address and `127.0.0.1` (M5)
 - No rootless user namespaces (M4)
 - No default AppArmor / SELinux labeling yet; `--apparmor PROFILE` is supported, but host-default labeling is still deferred (M4)
 - No image build (M7 — a Lisp-macro DSL called `defcontainer` is planned)

@@ -90,10 +90,19 @@ host_http_get() {
     local host_ip
     if [ "$(uname)" = "Darwin" ]; then
         host_ip="$(limactl shell letgo sh -lc "ip -4 route get 1.1.1.1 | awk '{print \$7; exit}'")"
-        limactl shell letgo sh -lc "wget -qO- http://${host_ip}:${port}${path}"
+        limactl shell letgo sh -lc "timeout 3 wget -qO- http://${host_ip}:${port}${path}"
     else
         host_ip="$(ip -4 route get 1.1.1.1 | awk '{print $7; exit}')"
-        wget -qO- "http://${host_ip}:${port}${path}"
+        timeout 3 wget -qO- "http://${host_ip}:${port}${path}"
+    fi
+}
+
+host_loopback_http_get() {
+    local port="$1" path="${2:-/}"
+    if [ "$(uname)" = "Darwin" ]; then
+        limactl shell letgo sh -lc "timeout 3 wget -qO- http://127.0.0.1:${port}${path}"
+    else
+        timeout 3 wget -qO- "http://127.0.0.1:${port}${path}"
     fi
 }
 
@@ -102,6 +111,21 @@ wait_for_host_http() {
     local out=""
     for _ in $(seq 1 80); do
         out="$(host_http_get "$port" "$path" 2>/dev/null || true)"
+        if echo "$out" | grep -qF -- "$needle"; then
+            printf '%s' "$out"
+            return 0
+        fi
+        sleep 0.25
+    done
+    printf '%s' "$out"
+    return 1
+}
+
+wait_for_loopback_http() {
+    local port="$1" needle="$2" path="${3:-/}"
+    local out=""
+    for _ in $(seq 1 80); do
+        out="$(host_loopback_http_get "$port" "$path" 2>/dev/null || true)"
         if echo "$out" | grep -qF -- "$needle"; then
             printf '%s' "$out"
             return 0
@@ -339,6 +363,8 @@ PUB_PORT=$((39000 + ($$ % 10000)))
 PCID=$("$LGCR" run -d --net bridge -p "${PUB_PORT}:8080" "$IMG" sh -c 'apk add --no-cache busybox-extras >/dev/null 2>&1 && while true; do printf "HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\nbridge-publish-ok" | nc -l -p 8080; done' 2>&1 | tail -1)
 OUT="$(wait_for_host_http "$PUB_PORT" "bridge-publish-ok" || true)"
 expect_contains "$OUT" "bridge-publish-ok" "host can reach published port"
+OUT="$(wait_for_loopback_http "$PUB_PORT" "bridge-publish-ok" || true)"
+expect_contains "$OUT" "bridge-publish-ok" "localhost can reach published port"
 "$LGCR" rm -f "${PCID:0:6}" > /dev/null
 set +e
 host_http_get "$PUB_PORT" >/dev/null 2>&1
@@ -350,6 +376,17 @@ if [ "$RC" -ne 0 ]; then
 else
     FAIL=$((FAIL + 1))
     echo "  FAIL [${CURRENT}] published port still reachable after cleanup"
+fi
+set +e
+host_loopback_http_get "$PUB_PORT" >/dev/null 2>&1
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+    PASS=$((PASS + 1))
+    echo "  ok  localhost published port closed after cleanup"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL [${CURRENT}] localhost published port still reachable after cleanup"
 fi
 
 section "run rejects -p outside bridge networking"
