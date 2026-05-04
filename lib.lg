@@ -267,6 +267,49 @@
       :else (on-err (str "unsupported network: " spec)))))
 
 ;; ---------------------------------------------------------------------------
+;; published port parsing
+;; ---------------------------------------------------------------------------
+
+(defn valid-port?
+  [n]
+  (and (int? n) (>= n 1) (<= n 65535)))
+
+(defn parse-publish-spec
+  "Parse -p/--publish HOSTPORT:CONTAINERPORT. TCP only for now."
+  [spec on-err]
+  (let [[host-port container-port extra] (str/split spec ":")]
+    (cond
+      extra
+      (on-err (str "invalid published port: " spec))
+
+      (not (numeric? host-port))
+      (on-err (str "published host port must be numeric: " host-port))
+
+      (not (numeric? container-port))
+      (on-err (str "published container port must be numeric: " container-port))
+
+      :else
+      (let [host-port      (parse-int host-port)
+            container-port (parse-int container-port)]
+        (cond
+          (not (valid-port? host-port))
+          (on-err (str "published host port out of range: " host-port))
+
+          (not (valid-port? container-port))
+          (on-err (str "published container port out of range: " container-port))
+
+          :else
+          {:host-port host-port
+           :container-port container-port
+           :proto "tcp"})))))
+
+(defn parse-publish-specs
+  [specs on-err]
+  (reduce (fn [acc spec] (conj acc (parse-publish-spec spec on-err)))
+          []
+          (or specs [])))
+
+;; ---------------------------------------------------------------------------
 ;; security parsing
 ;; ---------------------------------------------------------------------------
 

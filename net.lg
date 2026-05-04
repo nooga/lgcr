@@ -42,6 +42,52 @@
     (when (not= 0 (:exit result))
       (apply sh! add-args))))
 
+(defn delete-iptables-rule
+  [table chain rule]
+  (let [prefix     (if table ["iptables" "-t" table] ["iptables"])
+        check-args (into (into prefix ["-C" chain]) rule)
+        del-args   (into (into prefix ["-D" chain]) rule)]
+    (loop []
+      (let [result (apply os/sh check-args)]
+        (when (= 0 (:exit result))
+          (apply sh! del-args)
+          (recur))))))
+
+(defn publish-prerouting-rule [{:keys [host-port ip container-port proto]}]
+  ["-m" "addrtype" "--dst-type" "LOCAL"
+   "-p" proto
+   "--dport" (str host-port)
+   "-j" "DNAT"
+   "--to-destination" (str ip ":" container-port)])
+
+(defn publish-output-rule [{:keys [host-port ip container-port proto]}]
+  ["-m" "addrtype" "--dst-type" "LOCAL"
+   "-p" proto
+   "--dport" (str host-port)
+   "-j" "DNAT"
+   "--to-destination" (str ip ":" container-port)])
+
+(defn publish-forward-rule [{:keys [container-port ip proto bridge-name]}]
+  ["-o" bridge-name
+   "-d" ip
+   "-p" proto
+   "--dport" (str container-port)
+   "-j" "ACCEPT"])
+
+(defn install-published-port-rule
+  [bridge-name ip published-port]
+  (let [rule (assoc published-port :bridge-name bridge-name :ip ip)]
+    (ensure-iptables-rule "nat" "PREROUTING" (publish-prerouting-rule rule))
+    (ensure-iptables-rule "nat" "OUTPUT" (publish-output-rule rule))
+    (ensure-iptables-rule nil "FORWARD" (publish-forward-rule rule))))
+
+(defn remove-published-port-rule
+  [bridge-name ip published-port]
+  (let [rule (assoc published-port :bridge-name bridge-name :ip ip)]
+    (delete-iptables-rule nil "FORWARD" (publish-forward-rule rule))
+    (delete-iptables-rule "nat" "OUTPUT" (publish-output-rule rule))
+    (delete-iptables-rule "nat" "PREROUTING" (publish-prerouting-rule rule))))
+
 (defn ensure-bridge
   [bridge-name]
   (when (not= 0 (:exit (os/sh "ip" "link" "show" "dev" bridge-name)))
@@ -117,12 +163,13 @@
     (sh! "nsenter" "-t" (str pid) "-n" "ip" "link" "set" "lo" "up"))
   nil)
 
-(defmethod setup :bridge [container-id network {:keys [pid rootfs-merged]}]
+(defmethod setup :bridge [container-id network {:keys [pid rootfs-merged published-ports]}]
   (let [{:keys [name]} (normalize network)
         bridge-name (or name DEFAULT-BRIDGE-NAME)
         host-if     (host-if-name container-id)
         peer-if     (peer-if-name container-id)
-        ip          (bridge-ip-for-id container-id)]
+        ip          (bridge-ip-for-id container-id)
+        published-ports (lib/strip-nils published-ports)]
     (ensure-bridge bridge-name)
     (when rootfs-merged
       (ensure-bridge-resolver rootfs-merged))
@@ -138,6 +185,8 @@
     (sh! "nsenter" "-t" (str pid) "-n" "ip" "addr" "add" (str ip "/16") "dev" "eth0")
     (sh! "nsenter" "-t" (str pid) "-n" "ip" "link" "set" "eth0" "up")
     (sh! "nsenter" "-t" (str pid) "-n" "ip" "route" "add" "default" "via" DEFAULT-BRIDGE-GATEWAY)
+    (doseq [published-port published-ports]
+      (install-published-port-rule bridge-name ip published-port))
     (assoc (normalize network)
            :bridge-name bridge-name
            :subnet DEFAULT-BRIDGE-SUBNET
@@ -155,9 +204,14 @@
 (defmethod cleanup :none [_id network _state]
   (normalize network))
 
-(defmethod cleanup :bridge [container-id network _state]
-  (let [{:keys [host-if]} (normalize network)
-        host-if (or host-if (host-if-name container-id))]
+(defmethod cleanup :bridge [container-id network {:keys [published-ports]}]
+  (let [{:keys [host-if bridge-name ip]} (normalize network)
+        host-if     (or host-if (host-if-name container-id))
+        bridge-name (or bridge-name DEFAULT-BRIDGE-NAME)
+        ip          (or ip (bridge-ip-for-id container-id))
+        published-ports (lib/strip-nils published-ports)]
+    (doseq [published-port published-ports]
+      (remove-published-port-rule bridge-name ip published-port))
     (try-sh! "ip" "link" "del" host-if)
     (normalize network)))
 

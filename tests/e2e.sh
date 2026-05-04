@@ -85,6 +85,33 @@ pty_run() {
     fi
 }
 
+host_http_get() {
+    local port="$1" path="${2:-/}"
+    local host_ip
+    if [ "$(uname)" = "Darwin" ]; then
+        host_ip="$(limactl shell letgo sh -lc "ip -4 route get 1.1.1.1 | awk '{print \$7; exit}'")"
+        limactl shell letgo sh -lc "wget -qO- http://${host_ip}:${port}${path}"
+    else
+        host_ip="$(ip -4 route get 1.1.1.1 | awk '{print $7; exit}')"
+        wget -qO- "http://${host_ip}:${port}${path}"
+    fi
+}
+
+wait_for_host_http() {
+    local port="$1" needle="$2" path="${3:-/}"
+    local out=""
+    for _ in $(seq 1 80); do
+        out="$(host_http_get "$port" "$path" 2>/dev/null || true)"
+        if echo "$out" | grep -qF -- "$needle"; then
+            printf '%s' "$out"
+            return 0
+        fi
+        sleep 0.25
+    done
+    printf '%s' "$out"
+    return 1
+}
+
 json_field() {
     # (json_field <id> <field>) — reads state via `lgcr inspect` so this
     # works whether we're running inside Lima or driving the darwin shim
@@ -306,6 +333,32 @@ expect_contains "$OUT" "GATEWAY_OK" "bridge gateway reachable"
 section "run --net bridge can reach the internet through NAT"
 OUT=$("$LGCR" run --net bridge "$IMG" sh -c "wget -qO- http://example.com | grep -qi example && echo OUTBOUND_OK" 2>&1)
 expect_contains "$OUT" "OUTBOUND_OK" "bridge outbound connectivity"
+
+section "run --net bridge -p publishes a TCP port on the host"
+PUB_PORT=$((39000 + ($$ % 10000)))
+PCID=$("$LGCR" run -d --net bridge -p "${PUB_PORT}:8080" "$IMG" sh -c 'apk add --no-cache busybox-extras >/dev/null 2>&1 && while true; do printf "HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\nbridge-publish-ok" | nc -l -p 8080; done' 2>&1 | tail -1)
+OUT="$(wait_for_host_http "$PUB_PORT" "bridge-publish-ok" || true)"
+expect_contains "$OUT" "bridge-publish-ok" "host can reach published port"
+"$LGCR" rm -f "${PCID:0:6}" > /dev/null
+set +e
+host_http_get "$PUB_PORT" >/dev/null 2>&1
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+    PASS=$((PASS + 1))
+    echo "  ok  published port closed after cleanup"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL [${CURRENT}] published port still reachable after cleanup"
+fi
+
+section "run rejects -p outside bridge networking"
+set +e
+OUT=$("$LGCR" run --net host -p 18080:80 "$IMG" sh -c 'true' 2>&1)
+RC=$?
+set -e
+expect_eq "$RC" "1" "publish invalid network rc"
+expect_contains "$OUT" "published ports require --net bridge" "publish invalid network error"
 
 section "run --net bridge cleans up host veth on rm -f"
 BCID=$("$LGCR" run -d --net bridge "$IMG" sleep 30 2>&1 | tail -1)

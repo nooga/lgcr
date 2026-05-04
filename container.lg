@@ -144,7 +144,9 @@
 
 (defn read-state [id]
   (let [state (json/read-json (slurp (state-path id)) {:keywords? true})]
-    (assoc state :network (net/normalize (:network state)))))
+    (-> state
+        (assoc :network (net/normalize (:network state)))
+        (update :published-ports lib/strip-nils))))
 
 (defn write-state [{:keys [id] :as state}]
   (sys/mkdir-p (container-dir id) 0755)
@@ -248,6 +250,26 @@
   (doseq [{:keys [src]} (lib/strip-nils mounts)]
     (when-not (exists? src)
       (die "mount source does not exist: " src))))
+
+(defn validate-published-ports
+  [network published-ports]
+  (let [published-ports (lib/strip-nils published-ports)]
+    (when (and (seq published-ports) (not= :bridge (:type network)))
+    (die "published ports require --net bridge"))
+    (let [host-ports (mapv :host-port published-ports)]
+      (doseq [host-port host-ports]
+        (when (> (count (filter #(= host-port %) host-ports)) 1)
+          (die "duplicate published host port: " host-port))))
+    (doseq [id (list-container-ids)]
+      (let [state (try (read-state id) (catch e nil))
+            status (when state (effective-status state))]
+        (when (and state
+                   (or (= status "created") (= status "running")))
+          (doseq [{:keys [host-port]} (:published-ports state)]
+            (when (reduce (fn [acc p] (or acc (= host-port (:host-port p))))
+                          false
+                          published-ports)
+              (die "published host port already reserved: " host-port))))))))
 
 (defn mount-target-path [merged dst]
   (lib/path-join merged (subs dst 1)))
@@ -893,13 +915,14 @@
 
 (defn do-run [target user-cmd user-args
               {:keys [detached? tty? rm? extra-env hostname workdir mounts tmpfs network
-                      read-only? cap-add cap-drop seccomp apparmor] :as opts}]
+                      read-only? cap-add cap-drop seccomp apparmor publish] :as opts}]
   (let [{:keys [rootfs config]} (resolve-run-target target)
         [command args] (lib/compose-command config user-cmd user-args die)
         container-id (gen-id)
         hostname     (or hostname (str "lg-" (lib/short-id container-id)))
         mounts       (lib/parse-mount-specs mounts die)
         tmpfs-mounts (lib/parse-tmpfs-specs tmpfs die)
+        published-ports (lib/parse-publish-specs publish die)
         caps         (lib/resolve-capabilities cap-add cap-drop die)
         seccomp      (lib/parse-seccomp-spec seccomp die)
         apparmor     (lib/parse-apparmor-profile apparmor die)
@@ -909,6 +932,7 @@
     (when (and detached? tty?)
       (die "-it cannot be combined with -d"))
     (validate-mount-sources mounts)
+    (validate-published-ports network published-ports)
 
     ;; initial state.json (everything the shim needs)
     (sys/mkdir-p (container-dir container-id) 0755)
@@ -929,6 +953,7 @@
                     :apparmor-profile apparmor
                     :mounts        mounts
                     :tmpfs-mounts  tmpfs-mounts
+                    :published-ports published-ports
                     :network       network
                     :read-only?    (boolean read-only?)
                     :limits        limits
@@ -1582,6 +1607,8 @@
                             "-t"   [:tty?      :bool]
                             "-i"   [:_i        :ignore]
                             "-e"   [:extra-env :accumulate]
+                            "-p"   [:publish   :accumulate]
+                            "--publish" [:publish :accumulate]
                             "--seccomp" [:seccomp :value]
                             "--apparmor" [:apparmor :value]
                             "--cap-add" [:cap-add :accumulate]
@@ -1595,10 +1622,10 @@
                             "-w" [:workdir :value]
                             "--workdir" [:workdir :value]
                             "-h" [:hostname :value]
-                            "--hostname" [:hostname :value]}
+                           "--hostname" [:hostname :value]}
                            tail)]
       (if (< (count rest-args) 1)
-        (die "usage: lgcr run [-d|-it] [--rm] [--read-only] [--net host|none|bridge] [--tmpfs DST[:opts]] [--seccomp default|unconfined] [--apparmor PROFILE|unconfined] [--cap-add CAP] [--cap-drop CAP] [-e K=V]... [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image-or-rootfs> [command [args...]]")
+        (die "usage: lgcr run [-d|-it] [--rm] [--read-only] [--net host|none|bridge] [-p HOSTPORT:CONTPORT]... [--tmpfs DST[:opts]] [--seccomp default|unconfined] [--apparmor PROFILE|unconfined] [--cap-add CAP] [--cap-drop CAP] [-e K=V]... [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image-or-rootfs> [command [args...]]")
         (do-run (first rest-args)
                 (second rest-args)       ;; nil if not given
                 (vec (drop 2 rest-args))
@@ -1708,7 +1735,7 @@
       (println "let-go container runtime")
       (println)
       (println "usage:")
-      (println "  lgcr run [-d] [--rm] [--read-only] [--net host|none|bridge] [--tmpfs DST[:opts]] [--seccomp default|unconfined] [--apparmor PROFILE|unconfined] [--cap-add CAP] [--cap-drop CAP] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <rootfs-dir> <command> [args...]")
+      (println "  lgcr run [-d] [--rm] [--read-only] [--net host|none|bridge] [-p HOSTPORT:CONTPORT] [--tmpfs DST[:opts]] [--seccomp default|unconfined] [--apparmor PROFILE|unconfined] [--cap-add CAP] [--cap-drop CAP] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <rootfs-dir> <command> [args...]")
       (println "  lgcr ps [-a] [-q]")
       (println "  lgcr logs [-f] <id>")
       (println "  lgcr stop [-t SECS] <id>...")

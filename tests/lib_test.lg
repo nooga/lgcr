@@ -254,6 +254,19 @@
          (lib/parse-network-spec "bridge" throw-err))))
 
 ;; ---------------------------------------------------------------------------
+;; published port parsing
+;; ---------------------------------------------------------------------------
+
+(deftest parse-publish-spec-basic
+  (is (= {:host-port 8080 :container-port 80 :proto "tcp"}
+         (lib/parse-publish-spec "8080:80" throw-err))))
+
+(deftest parse-publish-specs-accumulates
+  (is (= [{:host-port 8080 :container-port 80 :proto "tcp"}
+          {:host-port 8443 :container-port 443 :proto "tcp"}]
+         (lib/parse-publish-specs ["8080:80" "8443:443"] throw-err))))
+
+;; ---------------------------------------------------------------------------
 ;; security parsing
 ;; ---------------------------------------------------------------------------
 
@@ -393,6 +406,8 @@
    "--rm" [:rm?        :bool]
    "-t"   [:tty?       :bool]
    "-i"   [:_i         :ignore]
+   "-p"   [:publish    :accumulate]
+   "--publish" [:publish :accumulate]
    "-e"   [:extra-env  :accumulate]})
 
 (deftest parse-flags-empty
@@ -426,6 +441,10 @@
 (deftest parse-flags-accumulate
   (is (= [{:extra-env ["A=1" "B=2"]} ["alpine"]]
          (lib/parse-flags RUN-SPEC ["-e" "A=1" "-e" "B=2" "alpine"]))))
+
+(deftest parse-flags-publish-accumulates
+  (is (= [{:publish ["8080:80" "8443:443"]} ["alpine"]]
+         (lib/parse-flags RUN-SPEC ["-p" "8080:80" "--publish=8443:443" "alpine"]))))
 
 (deftest parse-flags-value
   (is (= [{:signal "TERM"} ["abc"]]

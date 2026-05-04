@@ -56,7 +56,7 @@ lgcr logs -f "$cid"
 | `lgcr pull <image>` | Fetch an OCI image (Docker Hub or any v2 registry) |
 | `lgcr images [-q]` | List pulled images (name, size, age); `-q` just refs |
 | `lgcr rmi [-f] <image>...` | Remove an image; refuses if a container uses it unless `-f` |
-| `lgcr run [-d\|-it] [--rm] [--read-only] [--net host\|none] [--tmpfs DST[:opts]] [-e K=V] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image\|rootfs> [cmd [args...]]` | Run a container; auto-pulls if the image is missing; supports host/none networking, read-only rootfs, tmpfs, and bind mounts; `-d` detach, `-it` interactive pty |
+| `lgcr run [-d\|-it] [--rm] [--read-only] [--net host\|none\|bridge] [-p HOSTPORT:CONTPORT] [--tmpfs DST[:opts]] [-e K=V] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image\|rootfs> [cmd [args...]]` | Run a container; auto-pulls if the image is missing; supports host/none/bridge networking, bridge port publishing, read-only rootfs, tmpfs, and bind mounts; `-d` detach, `-it` interactive pty |
 | `lgcr exec [-it] [-e K=V] [-u USER[:GROUP]] <id> <cmd> [args...]` | Run a command inside a running container; `-it` for a pty; `-u` changes uid/gid |
 | `lgcr ps [-a] [-q]` | List containers; `-a` includes exited, `-q` just ids |
 | `lgcr logs [-f] <id>` | Dump or tail captured stdout/stderr |
@@ -148,7 +148,7 @@ lgcr exec "$cid" sh -c 'ls /proc | head'
 
 See [ROADMAP.md](./ROADMAP.md) for the plan. Short version:
 
-- No published ports yet; bridge networking provides isolated outbound connectivity, but there is still no `-p`/port-forwarding support (M5)
+- Bridge port publishing is implemented for `--net bridge` via `-p HOSTPORT:CONTPORT`; published ports are reachable on the host's non-loopback addresses, but `127.0.0.1` loopback publishing is not wired yet (M5)
 - No rootless user namespaces (M4)
 - No default AppArmor / SELinux labeling yet; `--apparmor PROFILE` is supported, but host-default labeling is still deferred (M4)
 - No image build (M7 — a Lisp-macro DSL called `defcontainer` is planned)
