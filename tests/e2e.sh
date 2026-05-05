@@ -316,6 +316,19 @@ section "ps -q outputs only short ids"
 OUT=$("$LGCR" ps -q)
 expect_eq "$OUT" "${CID:0:12}" "ps -q single line"
 
+section "help output is available at root and per-command"
+OUT=$("$LGCR" help 2>&1)
+expect_contains "$OUT" "Usage:" "root help prints usage"
+expect_contains "$OUT" "help [command]" "root help mentions help command"
+OUT=$("$LGCR" help ps 2>&1)
+expect_contains "$OUT" "lgcr ps [-a] [-q] [--json]" "command help prints command usage"
+expect_contains "$OUT" "--json" "command help shows json flag"
+
+section "ps --json emits structured output"
+OUT=$("$LGCR" ps --json 2>&1)
+expect_contains "$OUT" "\"short-id\":\"${CID:0:12}\"" "ps --json includes the current container"
+expect_contains "$OUT" "\"status\":\"running\"" "ps --json includes effective status"
+
 section "ps -aq combined short-flags split correctly"
 OUT=$("$LGCR" ps -aq)
 expect_contains "$OUT" "${CID:0:12}" "ps -aq still lists the container"
@@ -809,6 +822,12 @@ OUT=$("$LGCR" pull "$HELLO_IMG" 2>&1)
 expect_contains "$OUT" "resuming cached partial blob" "pull resumes a staged partial layer blob"
 expect_contains "$OUT" "[pull] rootfs ready" "pull succeeds after resuming the blob"
 
+section "CAS restarts a corrupt cached partial blob"
+vm_sh "root=\"\${XDG_DATA_HOME:-\$HOME/.local/share}/lgcr/images/blobs/sha256\"; src=\"\$root/${HELLO_LAYER_DIGEST#sha256:}\"; part=\"\$src.part\"; rm -f \"\$part\"; printf 'broken-partial' > \"\$part\"; rm -f \"\$src\""
+OUT=$("$LGCR" pull "$HELLO_IMG" 2>&1)
+expect_contains "$OUT" "failed integrity check after resume; restarting" "pull detects corrupt partial blob"
+expect_contains "$OUT" "[pull] rootfs ready" "pull succeeds after restarting corrupt partial blob"
+
 section "startup reconciliation removes completed store staging artifacts"
 vm_sh "broot=\"\${XDG_DATA_HOME:-\$HOME/.local/share}/lgcr/images/blobs/sha256\"; sroot=\"\${XDG_DATA_HOME:-\$HOME/.local/share}/lgcr/images/snapshots\"; cp \"\$broot/${HELLO_LAYER_DIGEST#sha256:}\" \"\$broot/${HELLO_LAYER_DIGEST#sha256:}.part\"; mkdir -p \"\$sroot/reconcile-check.tmp-123/rootfs\""
 "$LGCR" df > /dev/null 2>&1
@@ -825,6 +844,9 @@ expect_eq "$(df_row_field "$OUT" blobs count)" "$(cas_blob_count)" "df blob coun
 expect_eq "$(df_row_field "$OUT" snapshots count)" "$(cas_snapshot_count)" "df snapshot count matches CAS"
 expect_num_gt "$(df_row_field "$OUT" blobs bytes)" "0" "df reports non-zero blob bytes"
 expect_num_gt "$(df_row_field "$OUT" total bytes)" "0" "df reports non-zero total bytes"
+OUT=$("$LGCR" df --json 2>&1)
+expect_contains "$OUT" "\"type\":\"blobs\"" "df --json includes blob row"
+expect_contains "$OUT" "\"size-display\":\"" "df --json includes humanized size"
 
 section "images lists pulled images"
 OUT=$("$LGCR" images 2>&1)
@@ -833,6 +855,9 @@ expect_contains "$OUT" "$HELLO_REF" "hello image appears"
 OUT=$("$LGCR" images -q 2>&1)
 expect_contains "$OUT" "$HELLO_REF" "-q shows refs"
 expect_not_contains "$OUT" "IMAGE" "-q omits header"
+OUT=$("$LGCR" images --json 2>&1)
+expect_contains "$OUT" "\"ref\":\"$HELLO_REF\"" "images --json includes pulled ref"
+expect_contains "$OUT" "\"size-display\":\"" "images --json includes humanized size"
 
 section "rmi refuses to remove an image used by a container"
 CID=$("$LGCR" run -d "$IMG" sleep 30 2>&1 | tail -1)

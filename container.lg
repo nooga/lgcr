@@ -9,7 +9,7 @@
 ;; child is PID 1 in the new PID namespace.
 ;; The "init" command is internal — called by run via the re-exec.
 
-(ns container.runtime
+(ns container
   (:require [syscall :as sys]
             [unix :as unix]
             [term :as term]
@@ -778,7 +778,7 @@
 (defn reconcile-startup! []
   (doseq [id (list-container-ids)]
     (reconcile-container-state! id))
-  (imgstore/reconcile-store!))
+  (imgstore/reconcile-store))
 
 (defn do-run-detached [container-id]
   ;; Spawn ourselves as a shim, detached. The shim outlives us and owns
@@ -1084,18 +1084,21 @@
 
 ;; pad-right + format-cmd + render-status live in lib.lg
 
+(defn ps-rows [all?]
+  (->> (list-container-ids)
+       (reduce (fn [acc id]
+                 (if-let [st (try
+                               (let [s (read-state id)]
+                                 (assoc s :effective-status (effective-status s)))
+                               (catch e nil))]
+                   (conj acc st)
+                   acc))
+               [])
+       (filter (fn [{:keys [effective-status]}]
+                 (or all? (= "running" effective-status))))))
+
 (defn do-ps [{:keys [all? quiet?]}]
-  (let [rows  (->> (list-container-ids)
-                   (reduce (fn [acc id]
-                             (if-let [st (try
-                                           (let [s (read-state id)]
-                                             (assoc s :effective-status (effective-status s)))
-                                           (catch e nil))]
-                               (conj acc st)
-                               acc))
-                           [])
-                   (filter (fn [{:keys [effective-status]}]
-                             (or all? (= "running" effective-status)))))
+  (let [rows  (ps-rows all?)
         now-e (now-epoch)]
     (cond
       quiet?
@@ -1345,6 +1348,8 @@
 ;; OCI registry pull
 ;; ---------------------------------------------------------------------------
 
+(declare df-rows)
+
 (defn registry-url [registry path]
   (str "https://" registry path))
 
@@ -1377,6 +1382,9 @@
 (defn do-pull [image-ref]
   (imgstore/pull-image image-ref))
 
+(defn image-rows []
+  (imgstore/list-image-entries))
+
 (defn- containers-using-image
   "Return a seq of container ids whose :rootfs-src matches the given image rootfs."
   [image-rootfs]
@@ -1389,7 +1397,7 @@
           (list-container-ids)))
 
 (defn do-images [{:keys [quiet?]}]
-  (let [rows  (imgstore/list-image-entries)
+  (let [rows  (image-rows)
         now-e (now-epoch)]
     (cond
       quiet?
@@ -1437,30 +1445,7 @@
           (list-container-ids)))
 
 (defn do-df []
-  (let [store            (imgstore/store-stats)
-        container-ids    (list-container-ids)
-        container-count  (count container-ids)
-        container-bytes  (reduce (fn [a id] (+ a (container-disk-bytes id)))
-                                 0 container-ids)
-        total-bytes      (+ (get-in store [:total :bytes] 0) container-bytes)
-        rows             [{:type "blobs"
-                           :count (get-in store [:blobs :count] 0)
-                           :bytes (get-in store [:blobs :bytes] 0)}
-                          {:type "snapshots"
-                           :count (get-in store [:snapshots :count] 0)
-                           :bytes (get-in store [:snapshots :bytes] 0)}
-                          {:type "images"
-                           :count (get-in store [:images :count] 0)
-                           :bytes (get-in store [:images :bytes] 0)}
-                          {:type "refs"
-                           :count (get-in store [:refs :count] 0)
-                           :bytes (get-in store [:refs :bytes] 0)}
-                          {:type "containers"
-                           :count container-count
-                           :bytes container-bytes}
-                          {:type "total"
-                           :count "-"
-                           :bytes total-bytes}]]
+  (let [rows (df-rows)]
     (println (str (lib/pad-right "TYPE" 12)
                   (lib/pad-right "COUNT" 8)
                   (lib/pad-right "BYTES" 12)
@@ -1470,6 +1455,32 @@
                     (lib/pad-right (str count) 8)
                     (lib/pad-right (str bytes) 12)
                     (lib/humanize-bytes bytes))))))
+
+(defn df-rows []
+  (let [store            (imgstore/store-stats)
+        container-ids    (list-container-ids)
+        container-count  (count container-ids)
+        container-bytes  (reduce (fn [a id] (+ a (container-disk-bytes id)))
+                                 0 container-ids)
+        total-bytes      (+ (get-in store [:total :bytes] 0) container-bytes)]
+    [{:type "blobs"
+      :count (get-in store [:blobs :count] 0)
+      :bytes (get-in store [:blobs :bytes] 0)}
+     {:type "snapshots"
+      :count (get-in store [:snapshots :count] 0)
+      :bytes (get-in store [:snapshots :bytes] 0)}
+     {:type "images"
+      :count (get-in store [:images :count] 0)
+      :bytes (get-in store [:images :bytes] 0)}
+     {:type "refs"
+      :count (get-in store [:refs :count] 0)
+      :bytes (get-in store [:refs :bytes] 0)}
+     {:type "containers"
+      :count container-count
+      :bytes container-bytes}
+     {:type "total"
+      :count "-"
+      :bytes total-bytes}]))
 
 (defn do-prune
   "Remove stopped containers and/or unused images. With no flags, both.
@@ -1524,173 +1535,3 @@
 ;; detect bundled vs interpreted mode:
 ;; interpreted: [binary, script.lg, subcmd, ...]  → drop 2
 ;; bundled:     [binary, subcmd, ...]              → drop 1
-(let [bundled? (not (str/ends-with? (str (second os/args)) ".lg"))
-      args     (drop (if bundled? 1 2) os/args)
-      subcmd   (first args)
-      tail     (vec (drop 1 args))]
-  (when (and subcmd
-             (not= subcmd "init")
-             (not= subcmd "shim")
-             (not= subcmd "child-exec"))
-    (reconcile-startup!))
-  (cond
-    (= subcmd "run")
-    (let [[flags rest-args]
-          (lib/parse-flags {"-d"   [:detached? :bool]
-                            "--rm" [:rm?       :bool]
-                            "-t"   [:tty?      :bool]
-                            "-i"   [:_i        :ignore]
-                            "-e"   [:extra-env :accumulate]
-                            "-p"   [:publish   :accumulate]
-                            "--publish" [:publish :accumulate]
-                            "--seccomp" [:seccomp :value]
-                            "--apparmor" [:apparmor :value]
-                            "--cap-add" [:cap-add :accumulate]
-                            "--cap-drop" [:cap-drop :accumulate]
-                            "-v"   [:mounts    :accumulate]
-                            "--mount" [:mounts :accumulate]
-                            "--tmpfs" [:tmpfs :accumulate]
-                            "--net" [:network :value]
-                            "--network" [:network :value]
-                            "--read-only" [:read-only? :bool]
-                            "-w" [:workdir :value]
-                            "--workdir" [:workdir :value]
-                            "-h" [:hostname :value]
-                           "--hostname" [:hostname :value]}
-                           tail)]
-      (if (< (count rest-args) 1)
-        (die "usage: lgcr run [-d|-it] [--rm] [--read-only] [--net host|none|bridge] [-p HOSTPORT:CONTPORT]... [--tmpfs DST[:opts]] [--seccomp default|unconfined] [--apparmor PROFILE|unconfined] [--cap-add CAP] [--cap-drop CAP] [-e K=V]... [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image-or-rootfs> [command [args...]]")
-        (do-run (first rest-args)
-                (second rest-args)       ;; nil if not given
-                (vec (drop 2 rest-args))
-                flags)))
-
-    (= subcmd "shim")
-    (if (< (count tail) 1)
-      (die "usage: lgcr shim <id>  (internal)")
-      (do-shim (first tail)))
-
-    (= subcmd "logs")
-    (let [[flags rest-args] (lib/parse-flags {"-f" [:follow? :bool]} tail)]
-      (if (< (count rest-args) 1)
-        (die "usage: lgcr logs [-f] <id>")
-        (do-logs (first rest-args) (:follow? flags))))
-
-    (= subcmd "ps")
-    (let [[flags _] (lib/parse-flags {"-a" [:all?   :bool]
-                                      "-q" [:quiet? :bool]} tail)]
-      (do-ps flags))
-
-    (= subcmd "stop")
-    (let [[flags rest-args] (lib/parse-flags {"-t" [:grace :int]} tail)]
-      (if (< (count rest-args) 1)
-        (die "usage: lgcr stop [-t SECS] <id>...")
-        (doseq [id rest-args]
-          (do-stop id (or (:grace flags) 10)))))
-
-    (= subcmd "kill")
-    (let [[flags rest-args] (lib/parse-flags {"-s" [:signal :value]} tail)]
-      (if (< (count rest-args) 1)
-        (die "usage: lgcr kill [-s SIG] <id>...")
-        (let [sig (lib/parse-signal (:signal flags) die)]
-          (doseq [id rest-args] (do-kill id sig)))))
-
-    (= subcmd "rm")
-    (let [[flags rest-args] (lib/parse-flags {"-f" [:force? :bool]} tail)]
-      (if (< (count rest-args) 1)
-        (die "usage: lgcr rm [-f] <id>...")
-        (doseq [id rest-args] (do-rm id (:force? flags)))))
-
-    (= subcmd "inspect")
-    (if (< (count tail) 1)
-      (die "usage: lgcr inspect <id>")
-      (do-inspect (first tail)))
-
-    (= subcmd "exec")
-    (let [[flags rest-args]
-          (lib/parse-flags {"-e" [:extra-env :accumulate]
-                            "-t" [:tty?      :bool]
-                            "-i" [:_i        :ignore]
-                            "--seccomp" [:seccomp :value]
-                            "--apparmor" [:apparmor :value]
-                            "--cap-add" [:cap-add :accumulate]
-                            "--cap-drop" [:cap-drop :accumulate]
-                            "-u" [:user      :value]
-                            "--user" [:user  :value]}
-                           tail)]
-      (if (< (count rest-args) 2)
-        (die "usage: lgcr exec [-it] [--seccomp default|unconfined] [--apparmor PROFILE|unconfined] [--cap-add CAP] [--cap-drop CAP] [-e K=V]... [-u USER[:GROUP]] <id> <cmd> [args...]")
-        (do-exec (first rest-args) (vec (drop 1 rest-args))
-                 (:extra-env flags) (:tty? flags) (:user flags)
-                 (:cap-add flags) (:cap-drop flags)
-                 (:seccomp flags) (:apparmor flags))))
-
-    (= subcmd "start")
-    (if (< (count tail) 1)
-      (die "usage: lgcr start <id>...")
-      (doseq [id tail] (do-start id)))
-
-    (= subcmd "init")
-    (if (< (count tail) 1)
-      (die "usage: lgcr init <id>  (internal)")
-      (do-init (first tail)))
-
-    (= subcmd "child-exec")
-    (if (< (count tail) 1)
-      (die "usage: lgcr child-exec <payload>  (internal)")
-      (do-child-exec (first tail)))
-
-    (= subcmd "pull")
-    (if (< (count tail) 1)
-      (die "usage: container.lg pull <rootfs-url>")
-      (do-pull (first tail)))
-
-    (= subcmd "images")
-    (let [[flags _] (lib/parse-flags {"-q" [:quiet? :bool]} tail)]
-      (do-images flags))
-
-    (= subcmd "df")
-    (do
-      (when (seq tail)
-        (die "usage: lgcr df"))
-      (do-df))
-
-    (= subcmd "rmi")
-    (let [[flags rest-args] (lib/parse-flags {"-f" [:force? :bool]} tail)]
-      (if (< (count rest-args) 1)
-        (die "usage: lgcr rmi [-f] <image>...")
-        (doseq [t rest-args] (do-rmi t (:force? flags)))))
-
-    (= subcmd "prune")
-    (let [[flags rest-args]
-          (lib/parse-flags {"--containers" [:containers? :bool]
-                            "--images"     [:images?     :bool]}
-                           tail)]
-      (when (seq rest-args)
-        (die "usage: lgcr prune [--containers] [--images]"))
-      (do-prune flags))
-
-    :else
-    (do
-      (println "let-go container runtime")
-      (println)
-      (println "usage:")
-      (println "  lgcr run [-d] [--rm] [--read-only] [--net host|none|bridge] [-p HOSTPORT:CONTPORT] [--tmpfs DST[:opts]] [--seccomp default|unconfined] [--apparmor PROFILE|unconfined] [--cap-add CAP] [--cap-drop CAP] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <rootfs-dir> <command> [args...]")
-      (println "  lgcr ps [-a] [-q]")
-      (println "  lgcr logs [-f] <id>")
-      (println "  lgcr stop [-t SECS] <id>...")
-      (println "  lgcr kill [-s SIG] <id>...")
-      (println "  lgcr rm [-f] <id>...")
-      (println "  lgcr start <id>...")
-      (println "  lgcr inspect <id>")
-      (println "  lgcr exec [-it] [--seccomp default|unconfined] [--apparmor PROFILE|unconfined] [--cap-add CAP] [--cap-drop CAP] [-e K=V] [-u USER[:GROUP]] <id> <cmd> [args...]")
-      (println "  lgcr pull <image>            (e.g. alpine:3.21)")
-      (println "  lgcr images [-q]")
-      (println "  lgcr df")
-      (println "  lgcr rmi [-f] <image>...")
-      (println "  lgcr prune [--containers] [--images]")
-      (println)
-      (println "examples:")
-      (println "  lgcr pull alpine:3.21")
-      (println "  lgcr run alpine:3.21 /bin/sh")
-      (println "  lgcr run -d --rm alpine:3.21 sleep 60"))))

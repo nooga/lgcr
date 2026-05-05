@@ -192,6 +192,22 @@
         (sh! "mv" tmp-file dest))
       actual)))
 
+(defn install-verified-blob [tmp-file digest]
+  (let [actual (str "sha256:" (hash-file tmp-file))]
+    (if (not= digest actual)
+      actual
+      (do
+        (let [dest (blob-path actual)]
+          (ensure-parent-dir dest)
+          (if (exists? dest)
+            (if (blob-valid? actual)
+              (try (sys/rm tmp-file) (catch e nil))
+              (do
+                (try (sys/rm dest) (catch e nil))
+                (sh! "mv" tmp-file dest)))
+            (sh! "mv" tmp-file dest))
+          actual)))))
+
 (defn put-blob-from-string [content expected-digest suffix]
   (let [tmp-file (str "/tmp/lgcr-blob-" (rand-int 1000000000) suffix)]
     (spit tmp-file content)
@@ -208,11 +224,15 @@
 
 (defn registry-get [registry repo path token opts]
   (let [url     (registry-url registry (str "/v2/" repo path))
-        headers (cond-> {"Accept" (or (:accept opts)
-                                      "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json")}
+        headers (cond-> {"Accept" "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json"
+                         ;; Blob digests are for the exact transferred bytes, so
+                         ;; registry fetches must not be transparently gzip-decoded.
+                         "Accept-Encoding" "identity"}
+                  (:accept opts) (assoc "Accept" (:accept opts))
                   token (assoc "Authorization" (str "Bearer " token))
                   (:headers opts) (merge (:headers opts)))]
-    (http/get url (merge {:headers headers} (dissoc opts :accept)))))
+    (http/get url (lib/merge-http-opts {:headers headers}
+                                       (dissoc opts :accept)))))
 
 (defn pick-manifest [manifests arch os]
   (first (filter (fn [m]
@@ -229,6 +249,73 @@
       (str/includes? uname "arm")     "arm64"
       :else "amd64")))
 
+(defn finish-blob-download [part digest]
+  (let [actual (install-verified-blob part digest)]
+    (if (= actual digest)
+      {:ok? true :actual actual}
+      {:ok? false :actual actual})))
+
+(defn ensure-blob-download-attempt [registry repo digest token dest part restart? restart-count]
+  (let [resume-from (if (and (exists? part) (not restart?))
+                      (or (file-size-bytes part) 0)
+                      0)
+        req-headers (if (> resume-from 0)
+                      {"Range" (str "bytes=" resume-from "-")}
+                      nil)
+        resp (registry-get registry repo (str "/blobs/" digest) token
+                           {:accept "application/octet-stream"
+                            :as     :stream
+                            :headers req-headers})
+        status (:status resp)]
+    (cond
+      (= status 416)
+      (do
+        (println (str "[pull] cached partial blob " (subs digest 7 19) " is invalid; restarting"))
+        (try (sys/rm part) (catch e nil))
+        (io/close (:body resp))
+        (ensure-blob-download-attempt registry repo digest token dest part true (inc restart-count)))
+
+      (and (> resume-from 0) (= status 206))
+      (do
+        (println (str "[pull] resuming cached partial blob " (subs digest 7 19)
+                      " at byte " resume-from))
+        (let [w (open part :append)]
+          (io/copy (:body resp) w)
+          (close! w)
+          (io/close (:body resp))
+          (let [{:keys [ok? actual]} (finish-blob-download part digest)]
+            (if ok?
+              dest
+              (do
+                (when (> restart-count 0)
+                  (try (sys/rm part) (catch e nil))
+                  (die "digest mismatch for blob " digest " (got " actual ")"))
+                (println (str "[pull] cached partial blob " (subs digest 7 19)
+                              " failed integrity check after resume; restarting"))
+                (try (sys/rm part) (catch e nil))
+                (ensure-blob-download-attempt registry repo digest token dest part true (inc restart-count)))))))
+
+      :else
+      (do
+        (when (> resume-from 0)
+          (println (str "[pull] registry restarted blob " (subs digest 7 19)
+                        "; restarting from byte 0")))
+        (let [w (open part :write)]
+          (io/copy (:body resp) w)
+          (close! w)
+          (io/close (:body resp))
+          (let [{:keys [ok? actual]} (finish-blob-download part digest)]
+            (if ok?
+              dest
+              (do
+                (when (> restart-count 0)
+                  (try (sys/rm part) (catch e nil))
+                  (die "digest mismatch for blob " digest " (got " actual ")"))
+                (println (str "[pull] downloaded blob " (subs digest 7 19)
+                              " failed integrity check; retrying from byte 0"))
+                (try (sys/rm part) (catch e nil))
+                (ensure-blob-download-attempt registry repo digest token dest part true (inc restart-count))))))))))
+
 (defn ensure-blob-download [registry repo digest token]
   (let [dest (blob-path digest)
         part (blob-part-path digest)]
@@ -238,48 +325,7 @@
         (when (exists? dest)
           (println (str "[pull] refreshing corrupt cached blob " (subs digest 7 19)))
           (try (sys/rm dest) (catch e nil)))
-        (loop [restart? false]
-          (let [resume-from (if (and (exists? part) (not restart?))
-                              (or (file-size-bytes part) 0)
-                              0)
-                req-headers (if (> resume-from 0)
-                              {"Range" (str "bytes=" resume-from "-")}
-                              nil)
-                resp (registry-get registry repo (str "/blobs/" digest) token
-                                   {:accept "application/octet-stream"
-                                    :as     :stream
-                                    :headers req-headers})
-                status (:status resp)]
-            (cond
-              (= status 416)
-              (do
-                (println (str "[pull] cached partial blob " (subs digest 7 19) " is invalid; restarting"))
-                (try (sys/rm part) (catch e nil))
-                (io/close (:body resp))
-                (recur true))
-
-              (and (> resume-from 0) (= status 206))
-              (do
-                (println (str "[pull] resuming cached partial blob " (subs digest 7 19)
-                              " at byte " resume-from))
-                (let [w (open part :append)]
-                  (io/copy (:body resp) w)
-                  (close! w)
-                  (io/close (:body resp))
-                  (put-blob-from-file part digest)
-                  dest))
-
-              :else
-              (do
-                (when (> resume-from 0)
-                  (println (str "[pull] registry restarted blob " (subs digest 7 19)
-                                "; restarting from byte 0")))
-                (let [w (open part :write)]
-                  (io/copy (:body resp) w)
-                  (close! w)
-                  (io/close (:body resp))
-                  (put-blob-from-file part digest)
-                  dest)))))))))
+        (ensure-blob-download-attempt registry repo digest token dest part false 0)))))
 
 (defn ensure-snapshot [snapshot-id layer-digests]
   (let [dest-rootfs (snapshot-rootfs-path snapshot-id)]
@@ -591,7 +637,7 @@
 
     {:bytes @removed-bytes}))
 
-(defn reconcile-store! []
+(defn reconcile-store []
   (let [removed-bytes (atom 0)]
     (doseq [path (list-blob-part-paths)]
       (let [final (subs path 0 (- (count path) 5))]

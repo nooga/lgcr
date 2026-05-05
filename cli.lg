@@ -1,0 +1,353 @@
+(ns lgcr.cli
+  (:require [container :as rt]
+            [lib :as lib]
+            [string :as str]))
+
+(defn die [& msgs]
+  (binding [*out* *err*]
+    (println (apply str "error: " msgs)))
+  (os/exit 1))
+
+(def RUN-FLAGS
+  {"-d"   [:detached? :bool]
+   "--rm" [:rm?       :bool]
+   "-t"   [:tty?      :bool]
+   "-i"   [:_i        :ignore]
+   "-e"   [:extra-env :accumulate]
+   "-p"   [:publish   :accumulate]
+   "--publish" [:publish :accumulate]
+   "--seccomp" [:seccomp :value]
+   "--apparmor" [:apparmor :value]
+   "--cap-add" [:cap-add :accumulate]
+   "--cap-drop" [:cap-drop :accumulate]
+   "-v"   [:mounts    :accumulate]
+   "--mount" [:mounts :accumulate]
+   "--tmpfs" [:tmpfs :accumulate]
+   "--net" [:network :value]
+   "--network" [:network :value]
+   "--read-only" [:read-only? :bool]
+   "-w" [:workdir :value]
+   "--workdir" [:workdir :value]
+   "-h" [:hostname :value]
+   "--hostname" [:hostname :value]})
+
+(def EXEC-FLAGS
+  {"-e" [:extra-env :accumulate]
+   "-t" [:tty?      :bool]
+   "-i" [:_i        :ignore]
+   "--seccomp" [:seccomp :value]
+   "--apparmor" [:apparmor :value]
+   "--cap-add" [:cap-add :accumulate]
+   "--cap-drop" [:cap-drop :accumulate]
+   "-u" [:user      :value]
+   "--user" [:user  :value]})
+
+(def PS-FLAGS
+  {"-a" [:all? :bool]
+   "-q" [:quiet? :bool]
+   "--json" [:json? :bool]})
+
+(def IMAGES-FLAGS
+  {"-q" [:quiet? :bool]
+   "--json" [:json? :bool]})
+
+(def DF-FLAGS
+  {"--json" [:json? :bool]})
+
+(def STOP-FLAGS
+  {"-t" [:grace :int]})
+
+(def KILL-FLAGS
+  {"-s" [:signal :value]})
+
+(def RM-FLAGS
+  {"-f" [:force? :bool]})
+
+(def RMI-FLAGS
+  {"-f" [:force? :bool]})
+
+(def PRUNE-FLAGS
+  {"--containers" [:containers? :bool]
+   "--images"     [:images?     :bool]})
+
+(def HELP-TEXT
+  {"run" "lgcr run [-d|-it] [--rm] [--read-only] [--net host|none|bridge] [-p HOSTPORT:CONTPORT]... [--tmpfs DST[:opts]] [--seccomp default|unconfined] [--apparmor PROFILE|unconfined] [--cap-add CAP] [--cap-drop CAP] [-e K=V]... [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image-or-rootfs> [command [args...]]"
+   "logs" "lgcr logs [-f] <id>"
+   "ps" "lgcr ps [-a] [-q] [--json]"
+   "stop" "lgcr stop [-t SECS] <id>..."
+   "kill" "lgcr kill [-s SIG] <id>..."
+   "rm" "lgcr rm [-f] <id>..."
+   "inspect" "lgcr inspect <id>"
+   "exec" "lgcr exec [-it] [--seccomp default|unconfined] [--apparmor PROFILE|unconfined] [--cap-add CAP] [--cap-drop CAP] [-e K=V]... [-u USER[:GROUP]] <id> <cmd> [args...]"
+   "start" "lgcr start <id>..."
+   "pull" "lgcr pull <image>"
+   "images" "lgcr images [-q] [--json]"
+   "df" "lgcr df [--json]"
+   "rmi" "lgcr rmi [-f] <image>..."
+   "prune" "lgcr prune [--containers] [--images]"})
+
+(def HELP-DESCRIPTIONS
+  [["run" "Run a container from an image or rootfs"]
+   ["ps" "List containers"]
+   ["logs" "Show captured stdout/stderr"]
+   ["stop" "Stop containers gracefully"]
+   ["kill" "Send a signal to containers"]
+   ["rm" "Remove containers"]
+   ["start" "Restart stopped containers"]
+   ["inspect" "Dump container state JSON"]
+   ["exec" "Run a command in a running container"]
+   ["pull" "Fetch an OCI image"]
+   ["images" "List pulled images"]
+   ["df" "Show local disk usage"]
+   ["rmi" "Remove images"]
+   ["prune" "Remove unused containers/images"]
+   ["help" "Show help for a command"]])
+
+(defn bundled-args []
+  (let [bundled? (not (str/ends-with? (str (second os/args)) ".lg"))]
+    (vec (drop (if bundled? 1 2) os/args))))
+
+(defn public-command? [subcmd]
+  (and subcmd
+       (not= subcmd "init")
+       (not= subcmd "shim")
+       (not= subcmd "child-exec")))
+
+(defn json-print [x]
+  (println (json/write-json x)))
+
+(defn print-root-help []
+  (println "lgcr")
+  (println)
+  (println "A small let-go container runtime.")
+  (println)
+  (println "Usage:")
+  (println "  lgcr <command> [options]")
+  (println "  lgcr help [command]")
+  (println)
+  (println "Commands:")
+  (doseq [[cmd desc] HELP-DESCRIPTIONS]
+    (println (str "  " (lib/pad-right cmd 10) desc)))
+  (println)
+  (println "Use `lgcr help <command>` for command-specific usage.")
+  (println)
+  (println "Examples:")
+  (println "  lgcr pull alpine:3.21")
+  (println "  lgcr run alpine:3.21 /bin/sh")
+  (println "  lgcr ps --json"))
+
+(defn print-command-help [subcmd]
+  (if-let [usage (get HELP-TEXT subcmd)]
+    (do
+      (println usage)
+      (when (= subcmd "ps")
+        (println)
+        (println "Options:")
+        (println "  -a        include exited containers")
+        (println "  -q        print ids only")
+        (println "  --json    emit structured JSON"))
+      (when (= subcmd "images")
+        (println)
+        (println "Options:")
+        (println "  -q        print refs only")
+        (println "  --json    emit structured JSON"))
+      (when (= subcmd "df")
+        (println)
+        (println "Options:")
+        (println "  --json    emit structured JSON")))
+    (die "unknown help topic: " subcmd)))
+
+(defn ps-json-rows [all? quiet?]
+  (let [now-e (rt/now-epoch)]
+    (if quiet?
+      (reduce (fn [acc {:keys [id]}]
+                (let [id-str (str id)]
+                  (if (>= (count id-str) lib/SHORT-ID-LEN)
+                    (conj acc (lib/short-id id-str))
+                    acc)))
+              []
+              (rt/ps-rows all?))
+      (reduce (fn [acc {:keys [id created-epoch] :as row}]
+                (let [id-str (str id)]
+                  (if (>= (count id-str) lib/SHORT-ID-LEN)
+                    (conj acc {:id             id-str
+                               :short-id       (lib/short-id id-str)
+                               :status         (str (:effective-status row))
+                               :status-display (str (lib/render-status row now-e))
+                               :created-epoch  created-epoch
+                               :created-ago    (str (lib/humanize-ago (- now-e created-epoch)) " ago")
+                               :command        (str (lib/format-cmd row))})
+                    acc)))
+              []
+              (rt/ps-rows all?)))))
+
+(defn images-json-rows [quiet?]
+  (let [now-e (rt/now-epoch)]
+    (if quiet?
+      (reduce (fn [acc row] (conj acc (str (:ref row)))) [] (rt/image-rows))
+      (reduce (fn [acc {:keys [ref size pulled-epoch manifest-digest snapshot-id]}]
+                (conj acc {:ref             (str ref)
+                           :size            size
+                           :size-display    (lib/humanize-bytes size)
+                           :pulled-epoch    pulled-epoch
+                           :pulled-ago      (when pulled-epoch
+                                              (str (lib/humanize-ago (- now-e pulled-epoch)) " ago"))
+                           :manifest-digest (str manifest-digest)
+                           :snapshot-id     (str snapshot-id)}))
+              []
+              (rt/image-rows)))))
+
+(defn df-json-rows []
+  (reduce (fn [acc {:keys [type count bytes]}]
+            (conj acc {:type type
+                       :count count
+                       :bytes bytes
+                       :size-display (lib/humanize-bytes bytes)}))
+          []
+          (rt/df-rows)))
+
+(defn dispatch [args]
+  (let [subcmd (first args)
+        tail   (vec (drop 1 args))]
+    (when (public-command? subcmd)
+      (rt/reconcile-startup!))
+    (cond
+      (or (nil? subcmd) (= subcmd "help") (= subcmd "--help"))
+      (if (seq tail)
+        (print-command-help (first tail))
+        (print-root-help))
+
+      (= subcmd "run")
+      (if (reduce (fn [acc x] (or acc (= x "--help"))) false tail)
+        (print-command-help "run")
+        (let [[flags rest-args] (lib/parse-flags RUN-FLAGS tail)]
+          (if (< (count rest-args) 1)
+            (print-command-help "run")
+            (rt/do-run (first rest-args)
+                       (second rest-args)
+                       (vec (drop 2 rest-args))
+                       flags))))
+
+      (= subcmd "shim")
+      (if (< (count tail) 1)
+          (die "usage: lgcr shim <id>  (internal)")
+        (rt/do-shim (first tail)))
+
+      (= subcmd "logs")
+      (if (reduce (fn [acc x] (or acc (= x "--help"))) false tail)
+        (print-command-help "logs")
+        (let [[flags rest-args] (lib/parse-flags {"-f" [:follow? :bool]} tail)]
+          (if (< (count rest-args) 1)
+            (print-command-help "logs")
+            (rt/do-logs (first rest-args) (:follow? flags)))))
+
+      (= subcmd "ps")
+      (let [[flags rest-args] (lib/parse-flags PS-FLAGS tail)]
+        (when (seq rest-args)
+              (die "usage: " (get HELP-TEXT "ps")))
+        (if (:json? flags)
+          (json-print (ps-json-rows (:all? flags) (:quiet? flags)))
+          (rt/do-ps flags)))
+
+      (= subcmd "stop")
+      (if (reduce (fn [acc x] (or acc (= x "--help"))) false tail)
+        (print-command-help "stop")
+        (let [[flags rest-args] (lib/parse-flags STOP-FLAGS tail)]
+          (if (< (count rest-args) 1)
+            (print-command-help "stop")
+            (doseq [id rest-args]
+              (rt/do-stop id (or (:grace flags) 10))))))
+
+      (= subcmd "kill")
+      (if (reduce (fn [acc x] (or acc (= x "--help"))) false tail)
+        (print-command-help "kill")
+        (let [[flags rest-args] (lib/parse-flags KILL-FLAGS tail)]
+          (if (< (count rest-args) 1)
+            (print-command-help "kill")
+              (let [sig (lib/parse-signal (:signal flags) die)]
+              (doseq [id rest-args] (rt/do-kill id sig))))))
+
+      (= subcmd "rm")
+      (if (reduce (fn [acc x] (or acc (= x "--help"))) false tail)
+        (print-command-help "rm")
+        (let [[flags rest-args] (lib/parse-flags RM-FLAGS tail)]
+          (if (< (count rest-args) 1)
+            (print-command-help "rm")
+            (doseq [id rest-args] (rt/do-rm id (:force? flags))))))
+
+      (= subcmd "inspect")
+      (if (or (reduce (fn [acc x] (or acc (= x "--help"))) false tail)
+              (< (count tail) 1))
+        (print-command-help "inspect")
+        (rt/do-inspect (first tail)))
+
+      (= subcmd "exec")
+      (if (reduce (fn [acc x] (or acc (= x "--help"))) false tail)
+        (print-command-help "exec")
+        (let [[flags rest-args] (lib/parse-flags EXEC-FLAGS tail)]
+          (if (< (count rest-args) 2)
+            (print-command-help "exec")
+            (rt/do-exec (first rest-args) (vec (drop 1 rest-args))
+                        (:extra-env flags) (:tty? flags) (:user flags)
+                        (:cap-add flags) (:cap-drop flags)
+                        (:seccomp flags) (:apparmor flags)))))
+
+      (= subcmd "start")
+      (if (or (reduce (fn [acc x] (or acc (= x "--help"))) false tail)
+              (< (count tail) 1))
+        (print-command-help "start")
+        (doseq [id tail] (rt/do-start id)))
+
+      (= subcmd "init")
+      (if (< (count tail) 1)
+          (die "usage: lgcr init <id>  (internal)")
+        (rt/do-init (first tail)))
+
+      (= subcmd "child-exec")
+      (if (< (count tail) 1)
+          (die "usage: lgcr child-exec <payload>  (internal)")
+        (rt/do-child-exec (first tail)))
+
+      (= subcmd "pull")
+      (if (or (reduce (fn [acc x] (or acc (= x "--help"))) false tail)
+              (< (count tail) 1))
+        (print-command-help "pull")
+        (rt/do-pull (first tail)))
+
+      (= subcmd "images")
+      (let [[flags rest-args] (lib/parse-flags IMAGES-FLAGS tail)]
+        (when (seq rest-args)
+          (die "usage: " (get HELP-TEXT "images")))
+        (if (:json? flags)
+          (json-print (images-json-rows (:quiet? flags)))
+          (rt/do-images flags)))
+
+      (= subcmd "df")
+      (let [[flags rest-args] (lib/parse-flags DF-FLAGS tail)]
+        (when (seq rest-args)
+          (die "usage: " (get HELP-TEXT "df")))
+        (if (:json? flags)
+          (json-print (df-json-rows))
+          (rt/do-df)))
+
+      (= subcmd "rmi")
+      (if (reduce (fn [acc x] (or acc (= x "--help"))) false tail)
+        (print-command-help "rmi")
+        (let [[flags rest-args] (lib/parse-flags RMI-FLAGS tail)]
+          (if (< (count rest-args) 1)
+            (print-command-help "rmi")
+            (doseq [t rest-args] (rt/do-rmi t (:force? flags))))))
+
+      (= subcmd "prune")
+      (if (reduce (fn [acc x] (or acc (= x "--help"))) false tail)
+        (print-command-help "prune")
+        (let [[flags rest-args] (lib/parse-flags PRUNE-FLAGS tail)]
+          (when (seq rest-args)
+            (die "usage: " (get HELP-TEXT "prune")))
+          (rt/do-prune flags)))
+
+      :else
+      (die "unknown command: " subcmd " (use `lgcr help`)"))))
+
+(when (not= (second os/args) "-b")
+  (dispatch (bundled-args)))

@@ -610,6 +610,18 @@
     (str command " " (str/join " " args))
     (str command)))
 
+(defn merge-http-opts
+  "Merge request opts without letting nil :headers override computed base
+   headers. Extra headers override base headers key-by-key."
+  [base opts]
+  (let [base' (or base {})
+        opts' (or opts {})
+        merged-headers (cond-> (or (:headers base') {})
+                         (:headers opts') (merge (:headers opts')))]
+    (assoc (merge (dissoc base' :headers)
+                  (dissoc opts' :headers))
+           :headers merged-headers)))
+
 (defn render-status
   "Docker-style status column for ps, given a state map and current epoch."
   [{:keys [effective-status started-epoch finished-epoch exit-code signal pid]}

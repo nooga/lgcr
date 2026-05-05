@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Bundle container.lg into a standalone linux/arm64 binary using lg -b.
+# Bundle cli.lg into a standalone linux/arm64 binary using lg -b.
 #
 # On a macOS host we additionally compile a thin Go "forwarder" that
 # invokes the Linux binary inside a Lima VM — so `./lgcr` just works
@@ -34,8 +34,8 @@ echo "==> Building linux/arm64 let-go binary..."
 HOST_OS="$(uname)"
 if [ "$HOST_OS" = "Darwin" ]; then
     LINUX_OUT="${OUTPUT}.linux"
-    echo "==> Cross-bundling container.lg → $LINUX_OUT..."
-    "$LG_HOST" -b "$LINUX_OUT" -bundle-base "$LG_LINUX" "$SCRIPT_DIR/container.lg"
+    echo "==> Cross-bundling cli.lg → $LINUX_OUT..."
+    "$LG_HOST" -b "$LINUX_OUT" -bundle-base "$LG_LINUX" "$SCRIPT_DIR/cli.lg"
     chmod +x "$LINUX_OUT"
 
     echo "==> Building macOS forwarder → $OUTPUT..."
@@ -50,8 +50,8 @@ if [ "$HOST_OS" = "Darwin" ]; then
     echo "  $OUTPUT pull alpine:3.21"
     echo "  $OUTPUT run alpine:3.21 echo hello"
 else
-    echo "==> Cross-bundling container.lg → $OUTPUT..."
-    "$LG_HOST" -b "$OUTPUT" -bundle-base "$LG_LINUX" "$SCRIPT_DIR/container.lg"
+    echo "==> Cross-bundling cli.lg → $OUTPUT..."
+    "$LG_HOST" -b "$OUTPUT" -bundle-base "$LG_LINUX" "$SCRIPT_DIR/cli.lg"
     chmod +x "$OUTPUT"
     SIZE=$(ls -lh "$OUTPUT" | awk '{print $5}')
     echo "==> Done: $OUTPUT ($SIZE)"

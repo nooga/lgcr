@@ -371,6 +371,25 @@
   (is (= "sh -c echo hi"
          (lib/format-cmd {:command "sh" :args ["-c" "echo hi"]}))))
 
+(deftest merge-http-opts-keeps-base-headers
+  (is (= {:as :stream
+          :headers {"Accept" "application/json"
+                    "Authorization" "Bearer tok"}}
+         (lib/merge-http-opts {:headers {"Accept" "application/json"
+                                         "Authorization" "Bearer tok"}}
+                              {:as :stream})))
+  (is (= {:headers {"Accept" "application/json"
+                    "Authorization" "Bearer tok"
+                    "Range" "bytes=10-"}}
+         (lib/merge-http-opts {:headers {"Accept" "application/json"
+                                         "Authorization" "Bearer tok"}}
+                              {:headers {"Range" "bytes=10-"}})))
+  (is (= {:headers {"Accept" "application/json"
+                    "Authorization" "Bearer tok"}}
+         (lib/merge-http-opts {:headers {"Accept" "application/json"
+                                         "Authorization" "Bearer tok"}}
+                              {:headers nil}))))
+
 ;; ---------------------------------------------------------------------------
 ;; render-status
 ;; ---------------------------------------------------------------------------

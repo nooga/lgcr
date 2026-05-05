@@ -16,7 +16,7 @@ cd lgcr
 ./bundle.sh                                              # produces ./lgcr
 ```
 
-On Linux, `bundle.sh` cross-compiles let-go and bakes `container.lg` into
+On Linux, `bundle.sh` cross-compiles let-go and bakes `cli.lg` into
 a single static linux/arm64 binary (~14 MB).
 
 On **macOS**, it builds two things:
@@ -54,17 +54,19 @@ lgcr logs -f "$cid"
 | Command | Description |
 |---|---|
 | `lgcr pull <image>` | Fetch an OCI image (Docker Hub or any v2 registry) |
-| `lgcr images [-q]` | List pulled images (name, size, age); `-q` just refs |
+| `lgcr images [-q] [--json]` | List pulled images (name, size, age); `-q` just refs; `--json` emits structured output |
 | `lgcr rmi [-f] <image>...` | Remove an image; refuses if a container uses it unless `-f` |
 | `lgcr run [-d\|-it] [--rm] [--read-only] [--net host\|none\|bridge] [-p HOSTPORT:CONTPORT] [--tmpfs DST[:opts]] [-e K=V] [-w DIR] [-h NAME] [-v SRC:DST[:ro]] [--mount type=bind,src=SRC,dst=DST[,ro]] <image\|rootfs> [cmd [args...]]` | Run a container; auto-pulls if the image is missing; supports host/none/bridge networking, bridge port publishing, read-only rootfs, tmpfs, and bind mounts; `-d` detach, `-it` interactive pty |
 | `lgcr exec [-it] [-e K=V] [-u USER[:GROUP]] <id> <cmd> [args...]` | Run a command inside a running container; `-it` for a pty; `-u` changes uid/gid |
-| `lgcr ps [-a] [-q]` | List containers; `-a` includes exited, `-q` just ids |
+| `lgcr ps [-a] [-q] [--json]` | List containers; `-a` includes exited, `-q` just ids; `--json` emits structured output |
 | `lgcr logs [-f] <id>` | Dump or tail captured stdout/stderr |
 | `lgcr stop [-t SECS] <id>...` | SIGTERM, grace, SIGKILL |
 | `lgcr kill [-s SIG] <id>...` | Send a signal by name (`KILL`, `TERM`, …) or number |
 | `lgcr rm [-f] <id>...` | Remove; `-f` kills a running container first |
 | `lgcr start <id>...` | Respawn a stopped container with the same config |
 | `lgcr inspect <id>` | Dump the container's state as JSON |
+| `lgcr df [--json]` | Show local disk usage for the CAS and container state |
+| `lgcr help [command]` | Show top-level or per-command help |
 
 Short id prefixes work everywhere — `lgcr stop a1b2` is fine if unambiguous.
 Short flags combine: `lgcr ps -aq` = `lgcr ps -a -q`.
