@@ -27,7 +27,8 @@ if [ -z "${LGCR:-}" ]; then
         LGCR=/Users/nooga/lab/lgcr/lgcr
     fi
 fi
-IMG="${IMG:-alpine:3.21}"
+IMG="${IMG:-quay.io/libpod/alpine:latest}"
+HELLO_IMG="${HELLO_IMG:-quay.io/podman/hello:latest}"
 
 PASS=0
 FAIL=0
@@ -71,6 +72,116 @@ expect_not_contains() {
         echo "  FAIL [${CURRENT}] ${msg}: unexpectedly found '$needle'"
     fi
 }
+
+expect_num_gt() {
+    local got="$1" want="$2" msg="${3:-}"
+    if [ "$got" -gt "$want" ]; then
+        PASS=$((PASS + 1))
+        echo "  ok  ${msg:-$got > $want}"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL [${CURRENT}] ${msg}: want > $want got=$got"
+    fi
+}
+
+expect_num_lt() {
+    local got="$1" want="$2" msg="${3:-}"
+    if [ "$got" -lt "$want" ]; then
+        PASS=$((PASS + 1))
+        echo "  ok  ${msg:-$got < $want}"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL [${CURRENT}] ${msg}: want < $want got=$got"
+    fi
+}
+
+expect_ne() {
+    local got="$1" want="$2" msg="${3:-}"
+    if [ "$got" != "$want" ]; then
+        PASS=$((PASS + 1))
+        echo "  ok  ${msg:-$got != $want}"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  FAIL [${CURRENT}] ${msg}: both were $got"
+    fi
+}
+
+image_display_ref() {
+    local ref="$1" remainder first repo tag registry
+    remainder="$ref"
+    if [[ "$remainder" == *:* ]]; then
+        tag="${remainder##*:}"
+        remainder="${remainder%:*}"
+    else
+        tag="latest"
+    fi
+    first="${remainder%%/*}"
+    if [[ "$remainder" == */* ]] && { [[ "$first" == *.* ]] || [[ "$first" == *:* ]]; }; then
+        registry="$first"
+        repo="${remainder#*/}"
+    else
+        registry="registry-1.docker.io"
+        repo="$remainder"
+        if [[ "$repo" != */* ]]; then
+            repo="library/$repo"
+        fi
+    fi
+    if [ "$registry" = "registry-1.docker.io" ]; then
+        printf '%s:%s' "$repo" "$tag"
+    else
+        printf '%s/%s:%s' "$registry" "$repo" "$tag"
+    fi
+}
+
+vm_sh() {
+    if [ "$(uname)" = "Darwin" ]; then
+        limactl shell letgo sudo sh -lc "$*"
+    else
+        sh -lc "$*"
+    fi
+}
+
+cas_blob_count() {
+    vm_sh 'root="${XDG_DATA_HOME:-$HOME/.local/share}/lgcr/images/blobs/sha256"; if [ -d "$root" ]; then find "$root" -type f | wc -l | tr -d " "; else echo 0; fi'
+}
+
+cas_snapshot_count() {
+    vm_sh 'root="${XDG_DATA_HOME:-$HOME/.local/share}/lgcr/images/snapshots"; if [ -d "$root" ]; then find "$root" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d " "; else echo 0; fi'
+}
+
+img_meta_field() {
+    local manifest_hex="$1" field="$2"
+    manifest_hex="${manifest_hex#sha256:}"
+    vm_sh "f=\"\${XDG_DATA_HOME:-\$HOME/.local/share}/lgcr/images/images/sha256/${manifest_hex}.json\"; sed -n 's/.*\"${field}\":\"\\([^\"]*\\)\".*/\\1/p' \"\$f\" | head -1"
+}
+
+ref_record_field() {
+    local ref="$1" field="$2"
+    local remainder first repo tag registry path
+    remainder="$ref"
+    if [[ "$remainder" == *:* ]]; then
+        tag="${remainder##*:}"
+        remainder="${remainder%:*}"
+    else
+        tag="latest"
+    fi
+    first="${remainder%%/*}"
+    if [[ "$remainder" == */* ]] && { [[ "$first" == *.* ]] || [[ "$first" == *:* ]]; }; then
+        registry="$first"
+        repo="${remainder#*/}"
+    else
+        registry="registry-1.docker.io"
+        repo="$remainder"
+        if [[ "$repo" != */* ]]; then
+            repo="library/$repo"
+        fi
+    fi
+    path="\${XDG_DATA_HOME:-\$HOME/.local/share}/lgcr/images/refs/${registry}/${repo}/${tag}.json"
+    vm_sh "sed -n 's/.*\"${field}\":\"\\([^\"]*\\)\".*/\\1/p' \"$path\" | head -1"
+}
+
+IMG_REF="$(image_display_ref "$IMG")"
+HELLO_REF="$(image_display_ref "$HELLO_IMG")"
 
 pty_run() {
     # Run a shell command under a pty. `script`'s args differ between
@@ -161,7 +272,7 @@ for _id in $("$LGCR" ps -aq 2>/dev/null); do
     "$LGCR" rm -f "$_id" > /dev/null 2>&1 || true
 done
 
-if ! "$LGCR" images -q 2>/dev/null | grep -qF "library/${IMG/:/:}"; then
+if ! "$LGCR" images -q 2>/dev/null | grep -qF "$IMG_REF"; then
     echo "=== pulling $IMG (one-time) ==="
     "$LGCR" pull "$IMG" > /dev/null
 fi
@@ -224,17 +335,11 @@ expect_eq "$(json_field "${CID4:0:6}" signal)" "9" "signal=9"
 section "rm refuses a running container; -f overrides"
 CID5=$("$LGCR" run -d "$IMG" sleep 30 2>&1 | tail -1)
 sleep 1
-if "$LGCR" rm "${CID5:0:6}" 2>&1 | grep -q "is running"; then
-    PASS=$((PASS + 1)); echo "  ok  rm without -f refused"
-else
-    FAIL=$((FAIL + 1)); echo "  FAIL [${CURRENT}] rm did not refuse running container"
-fi
+OUT=$("$LGCR" rm "${CID5:0:6}" 2>&1 || true)
+expect_contains "$OUT" "is running" "rm without -f refused"
 "$LGCR" rm -f "${CID5:0:6}" > /dev/null
-if "$LGCR" ps -aq 2>/dev/null | grep -q "${CID5:0:12}"; then
-    FAIL=$((FAIL + 1)); echo "  FAIL [${CURRENT}] container still listed after rm -f"
-else
-    PASS=$((PASS + 1)); echo "  ok  rm -f removed the container"
-fi
+OUT=$("$LGCR" ps -aq 2>/dev/null || true)
+expect_not_contains "$OUT" "${CID5:0:12}" "rm -f removed the container"
 
 section "start respawns a stopped container"
 CID6=$("$LGCR" run -d "$IMG" sh -c 'echo one; sleep 30' 2>&1 | tail -1)
@@ -634,24 +739,41 @@ fi
 section "run auto-pulls a missing image"
 # Wipe hello-world from the image store via the tool (works through the
 # darwin shim too, since it forwards into Lima).
-"$LGCR" rmi -f hello-world > /dev/null 2>&1 || true
-OUT=$("$LGCR" run --rm hello-world 2>&1)
-expect_contains "$OUT" "Hello from Docker!" "scratch-image binary ran to completion"
+"$LGCR" rmi -f "$HELLO_IMG" > /dev/null 2>&1 || true
+HELLO_BASE_BLOBS="$(cas_blob_count)"
+HELLO_BASE_SNAPS="$(cas_snapshot_count)"
+OUT=$("$LGCR" run --rm "$HELLO_IMG" 2>&1)
+expect_contains "$OUT" "Hello Podman World" "scratch-image binary ran to completion"
 expect_contains "$OUT" "[pull]" "pull progress emitted on cold cache"
+HELLO_PULL_BLOBS="$(cas_blob_count)"
+HELLO_PULL_SNAPS="$(cas_snapshot_count)"
+expect_num_gt "$HELLO_PULL_BLOBS" "$HELLO_BASE_BLOBS" "auto-pull populated CAS blobs"
+expect_num_gt "$HELLO_PULL_SNAPS" "$HELLO_BASE_SNAPS" "auto-pull populated a snapshot"
 
 section "scratch rootfs (no /bin/rm) does not kill init"
 # Regression: sh! on /.pivot_old used to fail on scratch images and leave a
 # dangling ctrl.sock. Running twice in a row exercises the post-pivot cleanup.
-OUT=$("$LGCR" run --rm hello-world 2>&1)
-expect_contains "$OUT" "Hello from Docker!" "second run also succeeds"
+OUT=$("$LGCR" run --rm "$HELLO_IMG" 2>&1)
+expect_contains "$OUT" "Hello Podman World" "second run also succeeds"
 expect_not_contains "$OUT" "control socket never ready" "no stale-socket error"
+
+section "CAS reuses blobs and snapshots on repeated pull"
+OUT=$("$LGCR" pull "$HELLO_IMG" 2>&1)
+expect_contains "$OUT" "[pull] rootfs ready" "pull resolves through the CAS-backed store"
+expect_eq "$(cas_blob_count)" "$HELLO_PULL_BLOBS" "second pull reuses existing blobs"
+expect_eq "$(cas_snapshot_count)" "$HELLO_PULL_SNAPS" "second pull reuses existing snapshot"
+
+section "CAS snapshots are keyed by layer chain, not manifest digest"
+HELLO_MANIFEST_HEX="$(ref_record_field "$HELLO_IMG" manifest-digest)"
+HELLO_SNAPSHOT_ID="$(img_meta_field "$HELLO_MANIFEST_HEX" snapshot-id)"
+expect_ne "$HELLO_SNAPSHOT_ID" "$HELLO_MANIFEST_HEX" "snapshot id differs from manifest digest"
 
 section "images lists pulled images"
 OUT=$("$LGCR" images 2>&1)
 expect_contains "$OUT" "IMAGE" "header printed"
-expect_contains "$OUT" "hello-world" "hello-world appears"
+expect_contains "$OUT" "$HELLO_REF" "hello image appears"
 OUT=$("$LGCR" images -q 2>&1)
-expect_contains "$OUT" "hello-world" "-q shows refs"
+expect_contains "$OUT" "$HELLO_REF" "-q shows refs"
 expect_not_contains "$OUT" "IMAGE" "-q omits header"
 
 section "rmi refuses to remove an image used by a container"
@@ -689,11 +811,11 @@ fi
 "$LGCR" rm -f "${RUN_CID:0:6}" > /dev/null
 
 section "prune --images removes unused images only"
-"$LGCR" pull hello-world > /dev/null 2>&1
+"$LGCR" pull "$HELLO_IMG" > /dev/null 2>&1
 OUT=$("$LGCR" prune --images 2>&1)
 expect_contains "$OUT" "removed image" "reports each removed image"
 OUT=$("$LGCR" images -q 2>&1 || true)
-expect_not_contains "$OUT" "hello-world" "hello-world pruned"
+expect_not_contains "$OUT" "$HELLO_REF" "hello image pruned"
 # IMG is still present because we just used it above (and may be referenced
 # by still-stopped containers). We don't assert on its presence — the prune
 # above cleared containers, so it may or may not survive; both are fine.
@@ -706,15 +828,21 @@ expect_contains "$OUT" "pruned" "default prunes both"
 sleep 1
 expect_eq "$("$LGCR" ps -aq | wc -l | tr -d ' ')" "0" "no containers left"
 OUT=$("$LGCR" images -q 2>&1 || true)
-expect_not_contains "$OUT" "library/alpine:3.21" "prune removed alpine from image listing"
-expect_not_contains "$OUT" "hello-world" "prune removed hello-world from image listing"
+expect_not_contains "$OUT" "$IMG_REF" "prune removed base image from image listing"
+expect_not_contains "$OUT" "$HELLO_REF" "prune removed hello image from image listing"
 
 section "rmi removes an unused image"
-"$LGCR" pull hello-world > /dev/null 2>&1
-OUT=$("$LGCR" rmi hello-world 2>&1)
-expect_contains "$OUT" "removed hello-world" "rmi reports success"
+"$LGCR" pull "$HELLO_IMG" > /dev/null 2>&1
+PRE_RMI_BLOBS="$(cas_blob_count)"
+PRE_RMI_SNAPS="$(cas_snapshot_count)"
+OUT=$("$LGCR" rmi "$HELLO_IMG" 2>&1)
+expect_contains "$OUT" "removed $HELLO_IMG" "rmi reports success"
 OUT=$("$LGCR" images -q 2>&1 || true)
-expect_not_contains "$OUT" "hello-world" "image gone from listing"
+expect_not_contains "$OUT" "$HELLO_REF" "image gone from listing"
+POST_RMI_BLOBS="$(cas_blob_count)"
+POST_RMI_SNAPS="$(cas_snapshot_count)"
+expect_num_lt "$POST_RMI_BLOBS" "$PRE_RMI_BLOBS" "rmi gc removed orphaned blobs"
+expect_num_lt "$POST_RMI_SNAPS" "$PRE_RMI_SNAPS" "rmi gc removed orphaned snapshots"
 
 # ---------------------------------------------------------------------------
 # cleanup

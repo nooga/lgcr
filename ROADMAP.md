@@ -243,16 +243,20 @@ Arrives after the runtime is solid, because the build reuses the runtime.
 
 ## M8 — storage, images, polish
 
-- **Interim (done)**: flat per-ref image store moved to
-  `$XDG_DATA_HOME/lgcr/images/` (survives reboot); `images` + `rmi`
-  subcommands; `run` auto-pulls. This is scaffolding — replaced by:
-- Content-addressable layer store (blobs keyed by sha256, refs → manifest
-  digests, layers shared across images via overlay)
-- Image garbage collection (refcount layers, prune orphans)
-- `pull` resume on partial layers
-- Signature verification (cosign / sigstore) — optional
-- Robust cleanup on crash (state dir reconciliation on startup)
-- Better error messages with actionable suggestions
+- **Done**: content-addressable image store under
+  `$XDG_DATA_HOME/lgcr/images/` with:
+  - immutable blobs keyed by sha256
+  - refs → manifest metadata
+  - materialized snapshots for runtime rootfs use
+  - layer-chain-keyed snapshot identity instead of manifest-keyed snapshots
+  - `images`, `rmi`, `prune --images`, and `run` backed by the CAS
+  - garbage collection of orphaned refs, manifests, blobs, and snapshots
+- Still open:
+  - `pull` resume on partial layers
+  - explicit integrity scrub / verify command
+  - Signature verification (cosign / sigstore) — optional
+  - Robust cleanup on crash (state dir reconciliation on startup)
+  - Better error messages with actionable suggestions
 
 ## Cross-cutting / infrastructure
 

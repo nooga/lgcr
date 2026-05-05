@@ -1,0 +1,465 @@
+;; imgstore.lg — image/layer storage for lgcr.
+;;
+;; CAS layout under $XDG_DATA_HOME/lgcr/images:
+;;   blobs/sha256/<hex>          immutable manifest/config/layer blobs
+;;   refs/<registry>/<repo>/<tag>.json
+;;   images/sha256/<manifest>.json
+;;   snapshots/<snapshot-id>/{rootfs,metadata.json}
+
+(ns imgstore
+  (:require [syscall :as sys]
+            [string :as str]
+            [io :as io]
+            [lib :as lib]))
+
+(declare pull-image hash-file)
+
+(defn die [& msgs]
+  (binding [*out* *err*]
+    (println (apply str "error: " msgs)))
+  (os/exit 1))
+
+(defn sh! [& args]
+  (let [result (apply os/sh args)]
+    (when (not= 0 (:exit result))
+      (die "command failed: " (str/join " " args) "\n" (:err result)))
+    result))
+
+(defn exists? [path]
+  (not (nil? (os/stat path))))
+
+(defn now-epoch []
+  (parse-int (str/trim (:out (os/sh "date" "+%s")))))
+
+(defn image-root []
+  (let [xdg  (os/getenv "XDG_DATA_HOME")
+        home (os/getenv "HOME")
+        base (if (and xdg (not= xdg ""))
+               xdg
+               (str home "/.local/share"))]
+    (str base "/lgcr/images")))
+
+(defn blobs-root [] (str (image-root) "/blobs/sha256"))
+(defn refs-root [] (str (image-root) "/refs"))
+(defn images-root [] (str (image-root) "/images/sha256"))
+(defn snapshots-root [] (str (image-root) "/snapshots"))
+
+(defn digest-hex [digest]
+  (if (str/starts-with? digest "sha256:")
+    (subs digest 7)
+    digest))
+
+(defn ref-display [{:keys [registry repo tag]}]
+  (if (= registry "registry-1.docker.io")
+    (str repo ":" tag)
+    (str registry "/" repo ":" tag)))
+
+(defn ref-record-path [{:keys [registry repo tag]}]
+  (str (refs-root) "/" registry "/" repo "/" tag ".json"))
+
+(defn blob-path [digest]
+  (str (blobs-root) "/" (digest-hex digest)))
+
+(defn image-meta-path [manifest-digest]
+  (str (images-root) "/" (digest-hex manifest-digest) ".json"))
+
+(defn snapshot-id [layer-digests]
+  (let [layers (vec (lib/strip-nils layer-digests))]
+    (if (empty? layers)
+      (hash-file "/dev/null")
+      (loop [chain nil [layer & more] layers]
+        (if (nil? layer)
+          (digest-hex chain)
+          (let [tmp-file (str "/tmp/lgcr-chain-" (rand-int 1000000000) ".txt")
+                next-chain
+                (try
+                  (spit tmp-file (if chain
+                                   (str chain "\n" layer)
+                                   layer))
+                  (str "sha256:" (hash-file tmp-file))
+                  (finally
+                    (try (sys/rm tmp-file) (catch e nil))))]
+            (recur next-chain more)))))))
+
+(defn snapshot-dir [snapshot-id]
+  (str (snapshots-root) "/" snapshot-id))
+
+(defn snapshot-rootfs-path [snapshot-id]
+  (str (snapshot-dir snapshot-id) "/rootfs"))
+
+(defn snapshot-meta-path [snapshot-id]
+  (str (snapshot-dir snapshot-id) "/metadata.json"))
+
+(defn ensure-parent-dir [path]
+  (sys/mkdir-p (lib/path-dirname path) 0755))
+
+(defn read-json-file [path]
+  (json/read-json (slurp path) {:keywords? true}))
+
+(defn write-json-file [path data]
+  (ensure-parent-dir path)
+  (spit path (json/write-json data)))
+
+(defn dir-size-bytes [dir]
+  (let [r (os/sh "du" "-sb" dir)]
+    (when (= 0 (:exit r))
+      (try
+        (parse-int (first (str/split (str/trim (:out r)) "\t")))
+        (catch e nil)))))
+
+(defn file-size-bytes [path]
+  (let [r (os/sh "wc" "-c" path)]
+    (when (= 0 (:exit r))
+      (try
+        (parse-int (first (str/split (str/trim (:out r)) " ")))
+        (catch e nil)))))
+
+(defn hash-file [path]
+  (let [sum (fn [out]
+              (first (filter #(not= "" %)
+                             (str/split (str/trim out) " "))))]
+    (let [r (os/sh "sha256sum" path)]
+      (if (= 0 (:exit r))
+        (sum (:out r))
+        (let [r2 (os/sh "shasum" "-a" "256" path)]
+          (when (not= 0 (:exit r2))
+            (die "unable to hash file: " path))
+          (sum (:out r2)))))))
+
+(defn put-blob-from-file [tmp-file expected-digest]
+  (let [actual (str "sha256:" (hash-file tmp-file))]
+    (when (and expected-digest (not= expected-digest actual))
+      (try (sys/rm tmp-file) (catch e nil))
+      (die "digest mismatch for blob " expected-digest " (got " actual ")"))
+    (let [dest (blob-path actual)]
+      (ensure-parent-dir dest)
+      (if (exists? dest)
+        (try (sys/rm tmp-file) (catch e nil))
+        (sh! "mv" tmp-file dest))
+      actual)))
+
+(defn put-blob-from-string [content expected-digest suffix]
+  (let [tmp-file (str "/tmp/lgcr-blob-" (rand-int 1000000000) suffix)]
+    (spit tmp-file content)
+    (put-blob-from-file tmp-file expected-digest)))
+
+(defn registry-url [registry path]
+  (str "https://" registry path))
+
+(defn docker-auth-token [repo]
+  (let [url (str "https://auth.docker.io/token?service=registry.docker.io&scope=repository:" repo ":pull")
+        resp (http/get url)
+        body (json/read-json (:body resp) {:keywords? true})]
+    (:token body)))
+
+(defn registry-get [registry repo path token opts]
+  (let [url     (registry-url registry (str "/v2/" repo path))
+        headers (cond-> {"Accept" (or (:accept opts)
+                                      "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json")}
+                  token (assoc "Authorization" (str "Bearer " token)))]
+    (http/get url (merge {:headers headers} (dissoc opts :accept)))))
+
+(defn pick-manifest [manifests arch os]
+  (first (filter (fn [m]
+                   (let [p (:platform m)]
+                     (and (= (:architecture p) arch)
+                          (= (:os p) os))))
+                 manifests)))
+
+(defn host-arch []
+  (let [uname (:out (os/sh "uname" "-m"))]
+    (cond
+      (str/includes? uname "aarch64") "arm64"
+      (str/includes? uname "x86_64")  "amd64"
+      (str/includes? uname "arm")     "arm64"
+      :else "amd64")))
+
+(defn ensure-blob-download [registry repo digest token]
+  (let [dest (blob-path digest)]
+    (if (exists? dest)
+      dest
+      (let [tmp-file (str "/tmp/lgcr-layer-" (rand-int 1000000000) ".blob")
+            resp (registry-get registry repo (str "/blobs/" digest) token
+                               {:accept "application/octet-stream"
+                                :as     :stream})
+            w    (io/writer tmp-file)]
+        (io/copy (:body resp) w)
+        (io/close w)
+        (io/close (:body resp))
+        (put-blob-from-file tmp-file digest)
+        dest))))
+
+(defn ensure-snapshot [snapshot-id layer-digests]
+  (let [dest-rootfs (snapshot-rootfs-path snapshot-id)]
+    (if (exists? dest-rootfs)
+      dest-rootfs
+      (let [tmp-dir (str (snapshot-dir snapshot-id) ".tmp-" (rand-int 1000000000))
+            tmp-rootfs (str tmp-dir "/rootfs")]
+        (try
+          (sys/mkdir-p tmp-rootfs 0755)
+          (doseq [digest layer-digests]
+            (sh! "tar" "xzf" (blob-path digest) "-C" tmp-rootfs))
+          (write-json-file (str tmp-dir "/metadata.json")
+                           {:snapshot-id snapshot-id
+                            :layers      (vec layer-digests)
+                            :created-epoch (now-epoch)})
+          (sys/mkdir-p (snapshots-root) 0755)
+          (sh! "mv" tmp-dir (snapshot-dir snapshot-id))
+          dest-rootfs
+          (catch e
+            (try (sys/rm-rf tmp-dir) (catch e2 nil))
+            (throw e)))))))
+
+(defn write-image-meta [manifest-digest data]
+  (write-json-file (image-meta-path manifest-digest) data))
+
+(defn read-image-meta [manifest-digest]
+  (let [path (image-meta-path manifest-digest)]
+    (when (exists? path)
+      (read-json-file path))))
+
+(defn ref-record [parsed]
+  (let [path (ref-record-path parsed)]
+    (when (exists? path)
+      (read-json-file path))))
+
+(defn ref-exists? [parsed]
+  (exists? (ref-record-path parsed)))
+
+(defn write-ref-record [parsed manifest-digest sid]
+  (write-json-file (ref-record-path parsed)
+                   {:ref             (ref-display parsed)
+                    :registry        (:registry parsed)
+                    :repo            (:repo parsed)
+                    :tag             (:tag parsed)
+                    :manifest-digest manifest-digest
+                    :snapshot-id     sid
+                    :pulled-epoch    (now-epoch)})
+  sid)
+
+(defn cleanup-empty-ref-dirs []
+  (when (exists? (refs-root))
+    (let [r (os/sh "find" (refs-root) "-type" "d" "-empty" "-delete")]
+      (when-not (= 0 (:exit r))
+        nil))))
+
+(defn resolve-image-target [target]
+  (let [parsed (lib/parse-image-ref target)
+        rec0   (ref-record parsed)]
+    (when (or (nil? rec0)
+              (nil? (read-image-meta (:manifest-digest rec0)))
+              (not (exists? (snapshot-rootfs-path (:snapshot-id rec0)))))
+      (pull-image target))
+    (let [rec   (or (ref-record parsed) (die "image pull did not produce ref: " target))
+          meta  (or (read-image-meta (:manifest-digest rec))
+                    (die "image pull did not produce metadata for " target))
+          sid   (snapshot-id (:layers meta))]
+      (when (or (not= sid (:snapshot-id rec))
+                (not= sid (:snapshot-id meta))
+                (not (exists? (snapshot-rootfs-path sid))))
+        (ensure-snapshot sid (:layers meta))
+        (write-image-meta (:manifest-digest rec)
+                          (assoc meta :snapshot-id sid))
+        (write-ref-record parsed (:manifest-digest rec) sid))
+      {:rootfs (snapshot-rootfs-path sid)
+       :config (:config meta)})))
+
+(defn pull-image [image-ref]
+  (let [parsed     (lib/parse-image-ref image-ref)
+        {:keys [registry repo tag]} parsed
+        our-arch   (host-arch)]
+    (println (str "[pull] " registry "/" repo ":" tag " (" our-arch ")"))
+    (let [token (when (= registry "registry-1.docker.io")
+                  (println "[pull] authenticating with Docker Hub...")
+                  (docker-auth-token repo))]
+      (println "[pull] fetching manifest...")
+      (let [resp       (registry-get registry repo (str "/manifests/" tag) token {})
+            body-str   (:body resp)
+            body       (json/read-json body-str {:keywords? true})
+            media-type (or (:mediaType body)
+                           (get (:headers resp) "content-type"))
+            manifest-info
+            (if (or (str/includes? (str media-type) "manifest.list")
+                    (str/includes? (str media-type) "image.index"))
+              (if-let [selected (pick-manifest (:manifests body) our-arch "linux")]
+                (let [{:keys [digest mediaType]} selected]
+                  (println (str "[pull] selected platform: " our-arch "/linux"))
+                  (let [resp2 (registry-get registry repo (str "/manifests/" digest) token
+                                            {:accept mediaType})
+                        _     (put-blob-from-string (:body resp2) digest ".manifest.json")]
+                    {:digest digest
+                     :body   (json/read-json (:body resp2) {:keywords? true})}))
+                (die "no manifest found for " our-arch "/linux"))
+              (let [manifest-digest (put-blob-from-string body-str nil ".manifest.json")]
+                {:digest manifest-digest
+                 :body   body}))
+            manifest        (:body manifest-info)
+            manifest-digest (:digest manifest-info)
+            layers          (:layers manifest)]
+
+        (println (str "[pull] " (count layers) " layers to download"))
+        (doseq [{:keys [digest size]} layers]
+          (let [short-dig (subs digest 7 19)]
+            (println (str "[pull] layer " short-dig " (" size " bytes)"))
+            (ensure-blob-download registry repo digest token)))
+
+        (let [config-digest (get (:config manifest) :digest)]
+          (when config-digest
+            (println "[pull] fetching image config...")
+            (ensure-blob-download registry repo config-digest token))
+          (let [{:keys [config architecture]}
+                (if config-digest
+                  (read-json-file (blob-path config-digest))
+                  {:config {} :architecture our-arch})
+                {:keys [Env Cmd Entrypoint WorkingDir User]} config
+                img-arch (or architecture "")]
+            (when (and (not= "" img-arch) (not= img-arch our-arch))
+              (die "image is " img-arch " but host is " our-arch
+                   " — no " our-arch " variant is available for "
+                   repo ":" tag))
+            (let [sid        (snapshot-id (mapv :digest layers))
+                  reduced    {:env          (or Env [])
+                              :cmd          (or Cmd [])
+                              :entrypoint   (or Entrypoint [])
+                              :workdir      (or WorkingDir "")
+                              :user         (or User "")
+                              :ref          (ref-display parsed)
+                              :registry     registry
+                              :pulled-epoch (now-epoch)}
+                  snapshot-p (ensure-snapshot sid (mapv :digest layers))]
+              (write-ref-record parsed manifest-digest sid)
+              (write-image-meta manifest-digest
+                                {:manifest-digest manifest-digest
+                                 :config-digest   config-digest
+                                 :layers          (mapv :digest layers)
+                                 :snapshot-id     sid
+                                 :config          reduced
+                                 :pulled-epoch    (now-epoch)})
+              (println (str "[pull] rootfs ready at " snapshot-p))
+              snapshot-p)))))))
+
+(defn list-ref-records []
+  (if-not (exists? (refs-root))
+    []
+    (let [r (os/sh "find" (refs-root) "-type" "f" "-name" "*.json")]
+      (if (not= 0 (:exit r))
+        []
+        (reduce (fn [acc path]
+                  (if (= "" path)
+                    acc
+                    (let [rec (try (read-json-file path) (catch e nil))]
+                      (if rec (conj acc rec) acc))))
+                []
+                (str/split (:out r) "\n"))))))
+
+(defn list-image-entries []
+  (reduce (fn [acc {:keys [ref manifest-digest pulled-epoch snapshot-id] :as rec}]
+            (let [meta   (read-image-meta manifest-digest)
+                  rootfs (snapshot-rootfs-path snapshot-id)]
+              (if (or (nil? meta) (not (exists? rootfs)))
+                acc
+                (conj acc {:ref            ref
+                           :manifest-digest manifest-digest
+                           :snapshot-id     snapshot-id
+                           :pulled-epoch    pulled-epoch
+                           :rootfs          rootfs
+                           :size            (dir-size-bytes rootfs)}))))
+          []
+          (list-ref-records)))
+
+(defn find-image-entry [target]
+  (let [wanted (ref-display (lib/parse-image-ref target))]
+    (first (filter #(= wanted (:ref %)) (list-image-entries)))))
+
+(defn remove-ref [target]
+  (let [parsed (lib/parse-image-ref target)
+        path   (ref-record-path parsed)]
+    (when (exists? path)
+      (sys/rm path)
+      (cleanup-empty-ref-dirs))))
+
+(defn live-snapshot-id [rootfs]
+  (let [prefix (str (snapshots-root) "/")]
+    (when (and rootfs
+               (string? rootfs)
+               (str/starts-with? rootfs prefix)
+               (str/ends-with? rootfs "/rootfs"))
+      (let [rest (subs rootfs (count prefix))]
+        (first (str/split rest "/"))))))
+
+(defn list-image-meta-digests []
+  (if-not (exists? (images-root))
+    []
+    (let [r (os/sh "find" (images-root) "-type" "f" "-name" "*.json")]
+      (if (not= 0 (:exit r))
+        []
+        (reduce (fn [acc path]
+                  (if (= "" path)
+                    acc
+                    (conj acc (str "sha256:" (subs (last (str/split path "/"))
+                                                   0
+                                                   (- (count (last (str/split path "/"))) 5))))))
+                []
+                (str/split (:out r) "\n"))))))
+
+(defn list-snapshot-ids []
+  (if-not (exists? (snapshots-root))
+    []
+    (let [r (os/sh "find" (snapshots-root) "-mindepth" "1" "-maxdepth" "1" "-type" "d")]
+      (if (not= 0 (:exit r))
+        []
+        (reduce (fn [acc path]
+                  (if (= "" path)
+                    acc
+                    (conj acc (last (str/split path "/")))))
+                []
+                (str/split (:out r) "\n"))))))
+
+(defn list-blob-digests []
+  (if-not (exists? (blobs-root))
+    []
+    (let [r (os/sh "find" (blobs-root) "-type" "f")]
+      (if (not= 0 (:exit r))
+        []
+        (reduce (fn [acc path]
+                  (if (= "" path)
+                    acc
+                    (conj acc (str "sha256:" (last (str/split path "/"))))))
+                []
+                (str/split (:out r) "\n"))))))
+
+(defn gc! [live-rootfs-srcs]
+  (let [refs            (list-ref-records)
+        live-sids       (set (lib/strip-nils (mapv live-snapshot-id live-rootfs-srcs)))
+        keep-manifests  (set (mapv :manifest-digest refs))
+        keep-snapshots  (set (into (mapv :snapshot-id refs) live-sids))
+        keep-blobs      (reduce (fn [acc digest]
+                                  (if-let [meta (read-image-meta digest)]
+                                    (into acc (concat [(:manifest-digest meta)
+                                                       (:config-digest meta)]
+                                                      (:layers meta)))
+                                    acc))
+                                []
+                                keep-manifests)
+        keep-blobs      (set (lib/strip-nils keep-blobs))
+        removed-bytes   (atom 0)]
+
+    (doseq [digest (list-image-meta-digests)]
+      (when-not (contains? keep-manifests digest)
+        (let [path (image-meta-path digest)]
+          (swap! removed-bytes + (or (file-size-bytes path) 0))
+          (sys/rm path))))
+
+    (doseq [sid (list-snapshot-ids)]
+      (when-not (contains? keep-snapshots sid)
+        (let [dir (snapshot-dir sid)]
+          (swap! removed-bytes + (or (dir-size-bytes dir) 0))
+          (sys/rm-rf dir))))
+
+    (doseq [digest (list-blob-digests)]
+      (when-not (contains? keep-blobs digest)
+        (let [path (blob-path digest)]
+          (swap! removed-bytes + (or (file-size-bytes path) 0))
+          (sys/rm path))))
+
+    {:bytes @removed-bytes}))

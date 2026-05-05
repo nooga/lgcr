@@ -16,6 +16,7 @@
             [string :as str]
             [io :as io]
             [net :as net]
+            [imgstore :as imgstore]
             [lib :as lib]))
 
 ;; ---------------------------------------------------------------------------
@@ -73,22 +74,6 @@
 
 (defn container-dir [id]
   (str (state-root) "/containers/" id))
-
-;; TEMPORARY image store — flat per-ref rootfs dirs under $XDG_DATA_HOME/lgcr.
-;; Replaced by a content-addressable layer store in M8.
-(defn image-root []
-  (let [xdg  (os/getenv "XDG_DATA_HOME")
-        home (os/getenv "HOME")
-        base (if (and xdg (not= xdg ""))
-               xdg
-               (str home "/.local/share"))]
-    (str base "/lgcr/images")))
-
-(defn image-dir [parsed-ref]
-  (lib/image-rootfs-dir (image-root) parsed-ref))
-
-(defn image-config-path [dir]
-  (str dir "/.lgcr-config.json"))
 
 (defn gen-id []
   ;; 32 hex nibbles from rand-int. Not cryptographic, but fine for uniqueness.
@@ -901,15 +886,7 @@
   [target]
   (if (and (str/starts-with? target "/") (exists? target))
     {:rootfs target :config nil}
-    (let [ref (lib/parse-image-ref target)
-          dir (image-dir ref)
-          cfg (image-config-path dir)]
-      (when-not (exists? cfg)
-        (do-pull target)
-        (when-not (exists? cfg)
-          (die "image pull did not produce config: " cfg)))
-      {:rootfs dir
-       :config (json/read-json (slurp cfg) {:keywords? true})})))
+    (imgstore/resolve-image-target target)))
 
 ;; strip-nils + compose-command live in lib.lg
 
@@ -1345,165 +1322,21 @@
                  manifests)))
 
 (defn do-pull [image-ref]
-  (let [parsed     (lib/parse-image-ref image-ref)
-        {:keys [registry repo tag]} parsed
-        rootfs-dir (image-dir parsed)
-        ;; detect arch from our own binary
-        our-arch (let [uname (:out (os/sh "uname" "-m"))]
-                   (cond
-                     (str/includes? uname "aarch64") "arm64"
-                     (str/includes? uname "x86_64")  "amd64"
-                     (str/includes? uname "arm")     "arm64"
-                     :else "amd64"))]
-
-    (println (str "[pull] " registry "/" repo ":" tag " (" our-arch ")"))
-
-    ;; get auth token (Docker Hub specific, other registries may not need it)
-    (let [token (when (= registry "registry-1.docker.io")
-                  (println "[pull] authenticating with Docker Hub...")
-                  (docker-auth-token repo))]
-
-      ;; fetch manifest (could be a manifest list or a single manifest)
-      (println "[pull] fetching manifest...")
-      (let [resp       (registry-get registry repo (str "/manifests/" tag) token {})
-            body       (json/read-json (:body resp) {:keywords? true})
-            media-type (or (:mediaType body)
-                           (get (:headers resp) "content-type"))]
-
-        ;; handle manifest list / OCI index → pick platform, fetch actual manifest
-        (let [manifest
-              (if (or (str/includes? (str media-type) "manifest.list")
-                      (str/includes? (str media-type) "image.index"))
-                ;; it's a fat manifest — pick our platform
-                (if-let [selected (pick-manifest (:manifests body) our-arch "linux")]
-                  (let [{:keys [digest mediaType]} selected]
-                    (println (str "[pull] selected platform: " our-arch "/linux"))
-                    (let [resp2 (registry-get registry repo (str "/manifests/" digest) token
-                                              {:accept mediaType})]
-                      (json/read-json (:body resp2) {:keywords? true})))
-                  (die "no manifest found for " our-arch "/linux"))
-                ;; single manifest, use as-is
-                body)
-
-              layers (:layers manifest)]
-
-          (println (str "[pull] " (count layers) " layers to download"))
-          (try
-            ;; Start from a clean target dir so a failed or interrupted earlier
-            ;; pull cannot leave behind a misleading partial cache entry.
-            (try (sys/rm-rf rootfs-dir) (catch e nil))
-            (sh! "mkdir" "-p" rootfs-dir)
-
-            ;; download and extract each layer
-            (doseq [{:keys [digest size]} layers]
-              (let [short-dig (subs digest 7 19) ;; sha256:xxxx... → first 12 hex chars
-                    tmp-file  (str "/tmp/layer-" short-dig ".tar.gz")]
-
-                (println (str "[pull] layer " short-dig " (" size " bytes)"))
-
-                ;; stream download
-                (let [resp (registry-get registry repo (str "/blobs/" digest) token
-                                         {:accept "application/octet-stream"
-                                          :as     :stream})
-                      w    (io/writer tmp-file)]
-                  (io/copy (:body resp) w)
-                  (io/close w)
-                  (io/close (:body resp)))
-
-                ;; extract layer
-                (sh! "tar" "xzf" tmp-file "-C" rootfs-dir)
-                (sh! "rm" "-f" tmp-file)))
-
-            ;; fetch image config blob (ENTRYPOINT/CMD/ENV/WORKDIR/USER)
-            (when-let [{cfg-digest :digest} (:config manifest)]
-              (println "[pull] fetching image config...")
-              (let [resp (registry-get registry repo (str "/blobs/" cfg-digest) token
-                                       {:accept "application/octet-stream"})
-                    {:keys [config architecture]} (json/read-json (:body resp) {:keywords? true})
-                    {:keys [Env Cmd Entrypoint WorkingDir User]} config
-                    img-arch (or architecture "")]
-                (when (and (not= "" img-arch) (not= img-arch our-arch))
-                  ;; wipe the partial rootfs so we don't leave a broken image
-                  ;; around (and so a retry with a matching arch works cleanly)
-                  (try (sys/rm-rf rootfs-dir) (catch e nil))
-                  (die "image is " img-arch " but host is " our-arch
-                       " — no " our-arch " variant is available for "
-                       repo ":" tag))
-                (let [reduced {:env          (or Env [])
-                               :cmd          (or Cmd [])
-                               :entrypoint   (or Entrypoint [])
-                               :workdir      (or WorkingDir "")
-                               :user         (or User "")
-                               :ref          (str repo ":" tag)
-                               :registry     registry
-                               :pulled-epoch (now-epoch)}]
-                  (spit (image-config-path rootfs-dir)
-                        (json/write-json reduced)))))
-
-            (println (str "[pull] rootfs ready at " rootfs-dir))
-            rootfs-dir
-            (catch e
-              (try (sys/rm-rf rootfs-dir) (catch e2 nil))
-              (throw e))))))))
-
-;; ---------------------------------------------------------------------------
-;; images — list / remove
-;;
-;; TEMPORARY: flat per-ref rootfs dirs under `(image-root)`. Each has a
-;; `.lgcr-config.json` with :ref / :pulled-epoch metadata written by pull.
-;; Replaced by the CAS store in M8.
-;; ---------------------------------------------------------------------------
-
-(defn- dir-size-bytes
-  "Total bytes under `dir` via `du -sb`. Returns nil if du isn't available."
-  [dir]
-  (let [r (os/sh "du" "-sb" dir)]
-    (when (= 0 (:exit r))
-      (try (parse-int (first (str/split (str/trim (:out r)) "\t")))
-           (catch e nil)))))
-
-(defn- list-image-entries
-  "Scan the image store. Returns a seq of {:dir :ref :pulled-epoch :size}."
-  []
-  (let [root (image-root)]
-    (if (exists? root)
-      (let [ls (os/sh "ls" "-1" root)]
-        (if (= 0 (:exit ls))
-          (reduce
-           (fn [acc name]
-             (if (= "" name)
-               acc
-               (let [dir    (str root "/" name)
-                     config (let [p (image-config-path dir)]
-                              (when (exists? p)
-                                (try (json/read-json (slurp p) {:keywords? true})
-                                     (catch e nil))))]
-                 (if-not config
-                   acc
-                   (let [{:keys [ref pulled-epoch]} config]
-                     (conj acc {:dir          dir
-                                :subdir       name
-                                :ref          ref
-                                :pulled-epoch pulled-epoch
-                                :size         (dir-size-bytes dir)}))))))
-           []
-           (str/split (:out ls) "\n"))
-          []))
-      [])))
+  (imgstore/pull-image image-ref))
 
 (defn- containers-using-image
-  "Return a seq of container ids whose :rootfs-src matches the given image dir."
-  [image-dir]
+  "Return a seq of container ids whose :rootfs-src matches the given image rootfs."
+  [image-rootfs]
   (reduce (fn [acc id]
             (let [{:keys [rootfs-src]} (try (read-state id) (catch e nil))]
-              (if (= image-dir rootfs-src)
+              (if (= image-rootfs rootfs-src)
                 (conj acc id)
                 acc)))
           []
           (list-container-ids)))
 
 (defn do-images [{:keys [quiet?]}]
-  (let [rows  (list-image-entries)
+  (let [rows  (imgstore/list-image-entries)
         now-e (now-epoch)]
     (cond
       quiet?
@@ -1538,7 +1371,17 @@
    returns 0 on error. The overlay/run-dir is normally cleaned up by the
    shim on exit, so we don't try to account for it here."
   [id]
-  (or (dir-size-bytes (container-dir id)) 0))
+  (or (imgstore/dir-size-bytes (container-dir id)) 0))
+
+(defn- live-rootfs-sources []
+  (reduce (fn [acc id]
+            (let [st (try (read-state id) (catch e nil))
+                  rootfs-src (:rootfs-src st)]
+              (if rootfs-src
+                (conj acc rootfs-src)
+                acc)))
+          []
+          (list-container-ids)))
 
 (defn do-prune
   "Remove stopped containers and/or unused images. With no flags, both.
@@ -1556,17 +1399,16 @@
         i-result    (when do-i?
                       ;; Re-scan users *after* container prune so freshly
                       ;; orphaned images become eligible.
-                      (let [entries (list-image-entries)
-                            unused  (filter (fn [{:keys [dir]}]
-                                              (empty? (containers-using-image dir)))
+                      (let [entries (imgstore/list-image-entries)
+                            unused  (filter (fn [{:keys [rootfs]}]
+                                              (empty? (containers-using-image rootfs)))
                                             entries)
-                            bytes   (reduce (fn [a {:keys [size]}] (+ a (or size 0)))
-                                            0 unused)]
-                        (doseq [{:keys [dir ref size]} unused]
-                          (sys/rm-rf dir)
-                          (println (str "removed image " ref
-                                        " (" (lib/humanize-bytes (or size 0)) ")")))
-                        {:n (count unused) :bytes bytes}))
+                            refs    (mapv :ref unused)]
+                        (doseq [ref refs] (imgstore/remove-ref ref))
+                        (let [{:keys [bytes]} (imgstore/gc! (live-rootfs-sources))]
+                          (doseq [ref refs]
+                            (println (str "removed image " ref)))
+                          {:n (count refs) :bytes bytes})))
         c-n (get c-result :n 0)
         c-b (get c-result :bytes 0)
         i-n (get i-result :n 0)
@@ -1575,18 +1417,17 @@
                   "reclaimed " (lib/humanize-bytes (+ c-b i-b))))))
 
 (defn do-rmi [target force?]
-  (let [parsed (lib/parse-image-ref target)
-        dir    (image-dir parsed)]
-    (when-not (exists? dir)
+  (let [entry (imgstore/find-image-entry target)]
+    (when-not entry
       (die "no such image: " target))
-    (let [users (containers-using-image dir)]
+    (let [users (containers-using-image (:rootfs entry))]
       (when (and (seq users) (not force?))
         (die "image " target " is used by " (count users) " container(s): "
              (str/join ", " (mapv lib/short-id users))
              " (use -f to remove anyway)")))
-    (let [size (or (dir-size-bytes dir) 0)]
-      (sys/rm-rf dir)
-      (println (str "removed " target " (" (lib/humanize-bytes size) ")")))))
+    (imgstore/remove-ref target)
+    (let [{:keys [bytes]} (imgstore/gc! (live-rootfs-sources))]
+      (println (str "removed " target " (" (lib/humanize-bytes bytes) ")")))))
 
 ;; ---------------------------------------------------------------------------
 ;; main

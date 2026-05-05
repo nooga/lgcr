@@ -152,9 +152,10 @@ See [ROADMAP.md](./ROADMAP.md) for the plan. Short version:
 - No rootless user namespaces (M4)
 - No default AppArmor / SELinux labeling yet; `--apparmor PROFILE` is supported, but host-default labeling is still deferred (M4)
 - No image build (M7 — a Lisp-macro DSL called `defcontainer` is planned)
-- No content-addressable image store — each image ref gets its own flat
-  rootfs under `$XDG_DATA_HOME/lgcr/images/` (temporary; M8 replaces this
-  with a proper layer-sharing CAS)
+- The image store is now content-addressable (`blobs/`, `refs/`, `images/`,
+  `snapshots/`) with image GC and layer-chain-keyed snapshots, but it is
+  still a pragmatic first cut: pull resume / integrity scrub commands /
+  signature verification are still deferred (M8)
 
 ## Testing
 

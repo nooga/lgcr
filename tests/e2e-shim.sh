@@ -12,6 +12,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 SHIM="$ROOT/lgcr"
 LBIN="$ROOT/lgcr.linux"
+IMG="${IMG:-quay.io/libpod/alpine:latest}"
 
 PASS=0
 FAIL=0
@@ -103,13 +104,11 @@ expect_contains "$OUT" "brew install lima" "suggests the fix"
 
 section "shim forwards ps output identically to direct linux call"
 for id in $("$SHIM" ps -aq 2>/dev/null); do "$SHIM" rm -f "$id" > /dev/null || true; done
-# Seed a known-good Alpine rootfs through the Linux binary, then create the
+# Seed a known-good image through the Linux binary, then create the
 # container through the Linux binary as well. This keeps the test focused on
 # shim forwarding of ps/exec/inspect rather than detached-startup timing.
-ROOTFS=/root/.local/share/lgcr/images/library_alpine-3.21
-limactl shell letgo sudo rm -rf "$ROOTFS" > /dev/null 2>&1 || true
-limactl shell letgo sudo "$LBIN" pull alpine:3.21 > /dev/null 2>&1
-CID=$(limactl shell letgo sudo "$LBIN" run -d "$ROOTFS" sleep 30 | tail -1)
+limactl shell letgo sudo "$LBIN" pull "$IMG" > /dev/null 2>&1
+CID=$(limactl shell letgo sudo "$LBIN" run -d "$IMG" sleep 30 | tail -1)
 SHORT_ID="${CID:0:12}"
 SHIM_ROW=$(wait_for_shim_running_row "$SHORT_ID")
 LINUX_ROW=$(wait_for_linux_running_row "$SHORT_ID")
