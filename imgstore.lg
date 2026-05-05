@@ -126,6 +126,53 @@
             (die "unable to hash file: " path))
           (sum (:out r2)))))))
 
+(defn blob-valid? [digest]
+  (let [path (blob-path digest)]
+    (and digest
+         (exists? path)
+         (try
+           (= (digest-hex digest) (hash-file path))
+           (catch e false)))))
+
+(defn all-blobs-valid? [digests]
+  (reduce (fn [ok digest]
+            (and ok (blob-valid? digest)))
+          true
+          (lib/strip-nils digests)))
+
+(defn manifest-record [manifest-digest]
+  (when (blob-valid? manifest-digest)
+    (try
+      (read-json-file (blob-path manifest-digest))
+      (catch e nil))))
+
+(defn manifest-matches-meta? [{:keys [manifest-digest config-digest layers]}]
+  (let [manifest (manifest-record manifest-digest)
+        manifest-config (get (:config manifest) :digest)
+        manifest-layers (mapv :digest (:layers manifest))]
+    (and manifest
+         (= config-digest manifest-config)
+         (= (vec layers) manifest-layers))))
+
+(defn snapshot-valid? [sid layers]
+  (let [rootfs (snapshot-rootfs-path sid)
+        meta-p (snapshot-meta-path sid)
+        meta   (when (exists? meta-p)
+                 (try (read-json-file meta-p) (catch e nil)))]
+    (and sid
+         (exists? rootfs)
+         meta
+         (= sid (:snapshot-id meta))
+         (= (vec layers) (vec (:layers meta))))))
+
+(defn image-meta-intact? [meta]
+  (and meta
+       (:manifest-digest meta)
+       (all-blobs-valid? (concat [(:manifest-digest meta)
+                                  (:config-digest meta)]
+                                 (:layers meta)))
+       (manifest-matches-meta? meta)))
+
 (defn put-blob-from-file [tmp-file expected-digest]
   (let [actual (str "sha256:" (hash-file tmp-file))]
     (when (and expected-digest (not= expected-digest actual))
@@ -134,7 +181,11 @@
     (let [dest (blob-path actual)]
       (ensure-parent-dir dest)
       (if (exists? dest)
-        (try (sys/rm tmp-file) (catch e nil))
+        (if (blob-valid? actual)
+          (try (sys/rm tmp-file) (catch e nil))
+          (do
+            (try (sys/rm dest) (catch e nil))
+            (sh! "mv" tmp-file dest)))
         (sh! "mv" tmp-file dest))
       actual)))
 
@@ -176,18 +227,22 @@
 
 (defn ensure-blob-download [registry repo digest token]
   (let [dest (blob-path digest)]
-    (if (exists? dest)
+    (if (and (exists? dest) (blob-valid? digest))
       dest
-      (let [tmp-file (str "/tmp/lgcr-layer-" (rand-int 1000000000) ".blob")
-            resp (registry-get registry repo (str "/blobs/" digest) token
-                               {:accept "application/octet-stream"
-                                :as     :stream})
-            w    (io/writer tmp-file)]
-        (io/copy (:body resp) w)
-        (io/close w)
-        (io/close (:body resp))
-        (put-blob-from-file tmp-file digest)
-        dest))))
+      (do
+        (when (exists? dest)
+          (println (str "[pull] refreshing corrupt cached blob " (subs digest 7 19)))
+          (try (sys/rm dest) (catch e nil)))
+        (let [tmp-file (str "/tmp/lgcr-layer-" (rand-int 1000000000) ".blob")
+              resp (registry-get registry repo (str "/blobs/" digest) token
+                                 {:accept "application/octet-stream"
+                                  :as     :stream})
+              w    (io/writer tmp-file)]
+          (io/copy (:body resp) w)
+          (io/close w)
+          (io/close (:body resp))
+          (put-blob-from-file tmp-file digest)
+          dest)))))
 
 (defn ensure-snapshot [snapshot-id layer-digests]
   (let [dest-rootfs (snapshot-rootfs-path snapshot-id)]
@@ -250,19 +305,28 @@
               (nil? (read-image-meta (:manifest-digest rec0)))
               (not (exists? (snapshot-rootfs-path (:snapshot-id rec0)))))
       (pull-image target))
-    (let [rec   (or (ref-record parsed) (die "image pull did not produce ref: " target))
-          meta  (or (read-image-meta (:manifest-digest rec))
-                    (die "image pull did not produce metadata for " target))
-          sid   (snapshot-id (:layers meta))]
-      (when (or (not= sid (:snapshot-id rec))
-                (not= sid (:snapshot-id meta))
-                (not (exists? (snapshot-rootfs-path sid))))
-        (ensure-snapshot sid (:layers meta))
-        (write-image-meta (:manifest-digest rec)
-                          (assoc meta :snapshot-id sid))
-        (write-ref-record parsed (:manifest-digest rec) sid))
-      {:rootfs (snapshot-rootfs-path sid)
-       :config (:config meta)})))
+    (loop [attempt 0]
+      (let [rec   (or (ref-record parsed) (die "image pull did not produce ref: " target))
+            meta  (or (read-image-meta (:manifest-digest rec))
+                      (die "image pull did not produce metadata for " target))
+            sid   (snapshot-id (:layers meta))]
+        (if-not (image-meta-intact? meta)
+          (if (= attempt 0)
+            (do
+              (println "[pull] cached image metadata or blobs are missing/corrupt; refreshing image...")
+              (pull-image target)
+              (recur 1))
+            (die "image store integrity check failed for " target))
+          (do
+            (when (or (not= sid (:snapshot-id rec))
+                      (not= sid (:snapshot-id meta))
+                      (not (snapshot-valid? sid (:layers meta))))
+              (ensure-snapshot sid (:layers meta))
+              (write-image-meta (:manifest-digest rec)
+                                (assoc meta :snapshot-id sid))
+              (write-ref-record parsed (:manifest-digest rec) sid))
+            {:rootfs (snapshot-rootfs-path sid)
+             :config (:config meta)}))))))
 
 (defn pull-image [image-ref]
   (let [parsed     (lib/parse-image-ref image-ref)
@@ -463,3 +527,15 @@
           (sys/rm path))))
 
     {:bytes @removed-bytes}))
+
+(defn store-stats []
+  (let [blobs-bytes     (or (dir-size-bytes (blobs-root)) 0)
+        snapshots-bytes (or (dir-size-bytes (snapshots-root)) 0)
+        images-bytes    (or (dir-size-bytes (images-root)) 0)
+        refs-bytes      (or (dir-size-bytes (refs-root)) 0)
+        total-bytes     (or (dir-size-bytes (image-root)) 0)]
+    {:blobs     {:count (count (list-blob-digests))      :bytes blobs-bytes}
+     :snapshots {:count (count (list-snapshot-ids))      :bytes snapshots-bytes}
+     :images    {:count (count (list-image-meta-digests)) :bytes images-bytes}
+     :refs      {:count (count (list-ref-records))       :bytes refs-bytes}
+     :total     {:count nil                              :bytes total-bytes}}))

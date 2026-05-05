@@ -251,9 +251,10 @@ Arrives after the runtime is solid, because the build reuses the runtime.
   - layer-chain-keyed snapshot identity instead of manifest-keyed snapshots
   - `images`, `rmi`, `prune --images`, and `run` backed by the CAS
   - garbage collection of orphaned refs, manifests, blobs, and snapshots
+  - automatic local integrity verification on image resolve/pull, with
+    corrupt cached blobs refreshed from the registry
 - Still open:
   - `pull` resume on partial layers
-  - explicit integrity scrub / verify command
   - Signature verification (cosign / sigstore) — optional
   - Robust cleanup on crash (state dir reconciliation on startup)
   - Better error messages with actionable suggestions

@@ -155,6 +155,12 @@ img_meta_field() {
     vm_sh "f=\"\${XDG_DATA_HOME:-\$HOME/.local/share}/lgcr/images/images/sha256/${manifest_hex}.json\"; sed -n 's/.*\"${field}\":\"\\([^\"]*\\)\".*/\\1/p' \"\$f\" | head -1"
 }
 
+img_meta_first_layer() {
+    local manifest_hex="$1"
+    manifest_hex="${manifest_hex#sha256:}"
+    vm_sh "f=\"\${XDG_DATA_HOME:-\$HOME/.local/share}/lgcr/images/images/sha256/${manifest_hex}.json\"; sed -n 's/.*\"layers\":\\[\"\\([^\"]*\\)\".*/\\1/p' \"\$f\" | head -1"
+}
+
 ref_record_field() {
     local ref="$1" field="$2"
     local remainder first repo tag registry path
@@ -178,6 +184,17 @@ ref_record_field() {
     fi
     path="\${XDG_DATA_HOME:-\$HOME/.local/share}/lgcr/images/refs/${registry}/${repo}/${tag}.json"
     vm_sh "sed -n 's/.*\"${field}\":\"\\([^\"]*\\)\".*/\\1/p' \"$path\" | head -1"
+}
+
+df_row_field() {
+    local table="$1" row="$2" field="$3" idx
+    case "$field" in
+        count) idx=2 ;;
+        bytes) idx=3 ;;
+        size) idx=4 ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$table" | awk -v row="$row" -v idx="$idx" '$1 == row { print $idx; exit }'
 }
 
 IMG_REF="$(image_display_ref "$IMG")"
@@ -768,6 +785,25 @@ HELLO_MANIFEST_HEX="$(ref_record_field "$HELLO_IMG" manifest-digest)"
 HELLO_SNAPSHOT_ID="$(img_meta_field "$HELLO_MANIFEST_HEX" snapshot-id)"
 expect_ne "$HELLO_SNAPSHOT_ID" "$HELLO_MANIFEST_HEX" "snapshot id differs from manifest digest"
 
+section "CAS integrity checks refresh corrupt cached blobs automatically"
+HELLO_LAYER_DIGEST="$(img_meta_first_layer "$HELLO_MANIFEST_HEX")"
+vm_sh "printf 'broken' | dd of=\"\${XDG_DATA_HOME:-\$HOME/.local/share}/lgcr/images/blobs/sha256/${HELLO_LAYER_DIGEST#sha256:}\" bs=1 count=6 conv=notrunc >/dev/null 2>&1"
+OUT=$("$LGCR" run --rm "$HELLO_IMG" 2>&1)
+expect_contains "$OUT" "cached image metadata or blobs are missing/corrupt" "run detects local CAS corruption"
+expect_contains "$OUT" "refreshing corrupt cached blob" "pull repairs the corrupt blob"
+expect_contains "$OUT" "Hello Podman World" "run succeeds after CAS repair"
+
+section "df reports exact CAS counts and byte totals"
+OUT=$("$LGCR" df 2>&1)
+expect_contains "$OUT" "TYPE" "df prints a header"
+expect_contains "$OUT" "blobs" "df lists blob storage"
+expect_contains "$OUT" "snapshots" "df lists snapshots"
+expect_contains "$OUT" "containers" "df lists container state"
+expect_eq "$(df_row_field "$OUT" blobs count)" "$(cas_blob_count)" "df blob count matches CAS"
+expect_eq "$(df_row_field "$OUT" snapshots count)" "$(cas_snapshot_count)" "df snapshot count matches CAS"
+expect_num_gt "$(df_row_field "$OUT" blobs bytes)" "0" "df reports non-zero blob bytes"
+expect_num_gt "$(df_row_field "$OUT" total bytes)" "0" "df reports non-zero total bytes"
+
 section "images lists pulled images"
 OUT=$("$LGCR" images 2>&1)
 expect_contains "$OUT" "IMAGE" "header printed"
@@ -781,6 +817,9 @@ CID=$("$LGCR" run -d "$IMG" sleep 30 2>&1 | tail -1)
 sleep 1
 OUT=$("$LGCR" rmi "$IMG" 2>&1 || true)
 expect_contains "$OUT" "used by" "refuses while a container references it"
+OUT=$("$LGCR" df 2>&1)
+expect_num_gt "$(df_row_field "$OUT" containers count)" "0" "df counts live container state"
+expect_num_gt "$(df_row_field "$OUT" containers bytes)" "0" "df reports live container bytes"
 "$LGCR" rm -f "${CID:0:6}" > /dev/null
 
 section "prune --containers removes stopped containers only"

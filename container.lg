@@ -1383,6 +1383,41 @@
           []
           (list-container-ids)))
 
+(defn do-df []
+  (let [store            (imgstore/store-stats)
+        container-ids    (list-container-ids)
+        container-count  (count container-ids)
+        container-bytes  (reduce (fn [a id] (+ a (container-disk-bytes id)))
+                                 0 container-ids)
+        total-bytes      (+ (get-in store [:total :bytes] 0) container-bytes)
+        rows             [{:type "blobs"
+                           :count (get-in store [:blobs :count] 0)
+                           :bytes (get-in store [:blobs :bytes] 0)}
+                          {:type "snapshots"
+                           :count (get-in store [:snapshots :count] 0)
+                           :bytes (get-in store [:snapshots :bytes] 0)}
+                          {:type "images"
+                           :count (get-in store [:images :count] 0)
+                           :bytes (get-in store [:images :bytes] 0)}
+                          {:type "refs"
+                           :count (get-in store [:refs :count] 0)
+                           :bytes (get-in store [:refs :bytes] 0)}
+                          {:type "containers"
+                           :count container-count
+                           :bytes container-bytes}
+                          {:type "total"
+                           :count "-"
+                           :bytes total-bytes}]]
+    (println (str (lib/pad-right "TYPE" 12)
+                  (lib/pad-right "COUNT" 8)
+                  (lib/pad-right "BYTES" 12)
+                  "SIZE"))
+    (doseq [{:keys [type count bytes]} rows]
+      (println (str (lib/pad-right type 12)
+                    (lib/pad-right (str count) 8)
+                    (lib/pad-right (str bytes) 12)
+                    (lib/humanize-bytes bytes))))))
+
 (defn do-prune
   "Remove stopped containers and/or unused images. With no flags, both.
    An image is 'unused' when no container's :rootfs-src matches its dir."
@@ -1556,6 +1591,12 @@
     (let [[flags _] (lib/parse-flags {"-q" [:quiet? :bool]} tail)]
       (do-images flags))
 
+    (= subcmd "df")
+    (do
+      (when (seq tail)
+        (die "usage: lgcr df"))
+      (do-df))
+
     (= subcmd "rmi")
     (let [[flags rest-args] (lib/parse-flags {"-f" [:force? :bool]} tail)]
       (if (< (count rest-args) 1)
@@ -1587,6 +1628,7 @@
       (println "  lgcr exec [-it] [--seccomp default|unconfined] [--apparmor PROFILE|unconfined] [--cap-add CAP] [--cap-drop CAP] [-e K=V] [-u USER[:GROUP]] <id> <cmd> [args...]")
       (println "  lgcr pull <image>            (e.g. alpine:3.21)")
       (println "  lgcr images [-q]")
+      (println "  lgcr df")
       (println "  lgcr rmi [-f] <image>...")
       (println "  lgcr prune [--containers] [--images]")
       (println)

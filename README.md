@@ -154,8 +154,9 @@ See [ROADMAP.md](./ROADMAP.md) for the plan. Short version:
 - No image build (M7 — a Lisp-macro DSL called `defcontainer` is planned)
 - The image store is now content-addressable (`blobs/`, `refs/`, `images/`,
   `snapshots/`) with image GC and layer-chain-keyed snapshots, but it is
-  still a pragmatic first cut: pull resume / integrity scrub commands /
-  signature verification are still deferred (M8)
+  still a pragmatic first cut: pull resume and signature verification are
+  still deferred, while local integrity checks now happen automatically on
+  image resolve/pull (M8)
 
 ## Testing
 
