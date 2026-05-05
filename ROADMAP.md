@@ -254,9 +254,11 @@ Arrives after the runtime is solid, because the build reuses the runtime.
   - partial blob resume via staged `.part` downloads and HTTP range requests
   - automatic local integrity verification on image resolve/pull, with
     corrupt cached blobs refreshed from the registry
+  - startup reconciliation of stale container runtime state and orphaned
+    store staging artifacts (`ctrl.sock`, dead run dirs, snapshot temp dirs,
+    completed blob `.part` files)
 - Still open:
   - Signature verification (cosign / sigstore) — optional
-  - Robust cleanup on crash (state dir reconciliation on startup)
   - Better error messages with actionable suggestions
 
 ## Cross-cutting / infrastructure

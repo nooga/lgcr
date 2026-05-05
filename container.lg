@@ -727,6 +727,59 @@
       (sh! "rmdir" cg-path)
       (catch e nil))))
 
+(defn- cleanup-runtime-artifacts
+  [{:keys [id pid rootfs-merged run-dir cgroup mounts tmpfs-mounts network read-only?] :as state}]
+  (when (and pid (not (pid-alive? pid)))
+    (try
+      (sys/kill pid sys/SIGKILL)
+      (catch e nil)))
+  (when rootfs-merged
+    (net/cleanup id network state)
+    (unmount-tmpfs-mounts rootfs-merged tmpfs-mounts)
+    (when read-only?
+      (unmount-tmpfs-mounts rootfs-merged READONLY-TMPFS-MOUNTS))
+    (unmount-bind-mounts rootfs-merged mounts)
+    (try (sys/umount rootfs-merged 0) (catch e nil)))
+  (when run-dir
+    (try (sh! "rm" "-rf" run-dir) (catch e nil)))
+  (when cgroup
+    (try (sh! "rmdir" cgroup) (catch e nil)))
+  (let [sock (str (container-dir id) "/ctrl.sock")]
+    (when (exists? sock)
+      (try (sys/rm sock) (catch e nil)))))
+
+(defn- reconcile-container-state! [id]
+  (when-let [state (try (read-state id) (catch e nil))]
+    (let [status  (effective-status state)
+          stale?  (not= status (:status state))
+          stopped? (not= status "running")
+          state'  (if stale?
+                    (let [{:keys [iso epoch]} (now-stamp)]
+                      (update-state id
+                                    (fn [s]
+                                      (assoc s
+                                             :status status
+                                             :finished (or (:finished s) iso)
+                                             :finished-epoch (or (:finished-epoch s) epoch)))))
+                    state)
+          state'' (if stopped?
+                    (do
+                      (cleanup-runtime-artifacts state')
+                      (update-state id
+                                    (fn [s]
+                                      (assoc s
+                                             :pid nil
+                                             :rootfs-merged nil
+                                             :run-dir nil
+                                             :cgroup nil))))
+                    state')]
+      state'')))
+
+(defn reconcile-startup! []
+  (doseq [id (list-container-ids)]
+    (reconcile-container-state! id))
+  (imgstore/reconcile-store!))
+
 (defn do-run-detached [container-id]
   ;; Spawn ourselves as a shim, detached. The shim outlives us and owns
   ;; the container's lifecycle. For debugging, shim stderr goes to a file
@@ -1475,6 +1528,11 @@
       args     (drop (if bundled? 1 2) os/args)
       subcmd   (first args)
       tail     (vec (drop 1 args))]
+  (when (and subcmd
+             (not= subcmd "init")
+             (not= subcmd "shim")
+             (not= subcmd "child-exec"))
+    (reconcile-startup!))
   (cond
     (= subcmd "run")
     (let [[flags rest-args]

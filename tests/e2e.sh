@@ -753,6 +753,16 @@ if [ -n "$HOST_RC" ]; then
     expect_contains "$OUT" "$HOST_RC" "container sees host's first resolv.conf line"
 fi
 
+section "startup reconciliation cleans stale container runtime state"
+STALE_ID="11111111111111111111111111111111"
+vm_sh 'sid="11111111111111111111111111111111"; sroot="${XDG_STATE_HOME:-$HOME/.local/state}/lgcr"; cdir="$sroot/containers/$sid"; rdir="/tmp/lgcr-stale-run"; mdir="$rdir/merged"; mkdir -p "$cdir" "$mdir"; : > "$cdir/ctrl.sock"; printf "%s" "{\"id\":\"$sid\",\"status\":\"running\",\"pid\":999999,\"rootfs-merged\":\"$mdir\",\"run-dir\":\"$rdir\",\"network\":{\"type\":\"host\"},\"mounts\":[],\"tmpfs-mounts\":[],\"read-only?\":false,\"created\":\"2026-01-01T00:00:00Z\",\"created-epoch\":1767225600}" > "$cdir/state.json"'
+"$LGCR" ps -a > /dev/null 2>&1
+expect_eq "$(json_field "$STALE_ID" status)" "dead" "stale running state persisted as dead"
+expect_eq "$(json_field "$STALE_ID" pid)" "null" "reconciliation clears stale pid"
+expect_eq "$(vm_sh '[ -e "${XDG_STATE_HOME:-$HOME/.local/state}/lgcr/containers/11111111111111111111111111111111/ctrl.sock" ] && echo yes || echo no')" "no" "reconciliation removes stale control socket"
+expect_eq "$(vm_sh '[ -e /tmp/lgcr-stale-run ] && echo yes || echo no')" "no" "reconciliation removes stale run dir"
+"$LGCR" rm -f "${STALE_ID:0:6}" > /dev/null 2>&1 || true
+
 section "run auto-pulls a missing image"
 # Wipe hello-world from the image store via the tool (works through the
 # darwin shim too, since it forwards into Lima).
@@ -798,6 +808,12 @@ vm_sh "root=\"\${XDG_DATA_HOME:-\$HOME/.local/share}/lgcr/images/blobs/sha256\";
 OUT=$("$LGCR" pull "$HELLO_IMG" 2>&1)
 expect_contains "$OUT" "resuming cached partial blob" "pull resumes a staged partial layer blob"
 expect_contains "$OUT" "[pull] rootfs ready" "pull succeeds after resuming the blob"
+
+section "startup reconciliation removes completed store staging artifacts"
+vm_sh "broot=\"\${XDG_DATA_HOME:-\$HOME/.local/share}/lgcr/images/blobs/sha256\"; sroot=\"\${XDG_DATA_HOME:-\$HOME/.local/share}/lgcr/images/snapshots\"; cp \"\$broot/${HELLO_LAYER_DIGEST#sha256:}\" \"\$broot/${HELLO_LAYER_DIGEST#sha256:}.part\"; mkdir -p \"\$sroot/reconcile-check.tmp-123/rootfs\""
+"$LGCR" df > /dev/null 2>&1
+expect_eq "$(vm_sh '[ -e "${XDG_DATA_HOME:-$HOME/.local/share}/lgcr/images/blobs/sha256/'"${HELLO_LAYER_DIGEST#sha256:}"'.part" ] && echo yes || echo no')" "no" "reconciliation removes completed blob part files"
+expect_eq "$(vm_sh '[ -d "${XDG_DATA_HOME:-$HOME/.local/share}/lgcr/images/snapshots/reconcile-check.tmp-123" ] && echo yes || echo no')" "no" "reconciliation removes snapshot temp dirs"
 
 section "df reports exact CAS counts and byte totals"
 OUT=$("$LGCR" df 2>&1)

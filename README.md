@@ -156,7 +156,8 @@ See [ROADMAP.md](./ROADMAP.md) for the plan. Short version:
   `snapshots/`) with image GC and layer-chain-keyed snapshots, but it is
   still a pragmatic first cut: signature verification is still deferred,
   while partial blob download resume and local integrity checks now happen
-  automatically on pull / image resolve (M8)
+  automatically on pull / image resolve, and startup reconciliation cleans
+  stale runtime/store staging after crashes (M8)
 
 ## Testing
 

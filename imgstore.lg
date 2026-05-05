@@ -529,6 +529,32 @@
                 []
                 (str/split (:out r) "\n"))))))
 
+(defn list-blob-part-paths []
+  (if-not (exists? (blobs-root))
+    []
+    (let [r (os/sh "find" (blobs-root) "-type" "f" "-name" "*.part")]
+      (if (not= 0 (:exit r))
+        []
+        (reduce (fn [acc path]
+                  (if (= "" path)
+                    acc
+                    (conj acc path)))
+                []
+                (str/split (:out r) "\n"))))))
+
+(defn list-snapshot-temp-dirs []
+  (if-not (exists? (snapshots-root))
+    []
+    (let [r (os/sh "find" (snapshots-root) "-mindepth" "1" "-maxdepth" "1" "-type" "d" "-name" "*.tmp-*")]
+      (if (not= 0 (:exit r))
+        []
+        (reduce (fn [acc path]
+                  (if (= "" path)
+                    acc
+                    (conj acc path)))
+                []
+                (str/split (:out r) "\n"))))))
+
 (defn gc! [live-rootfs-srcs]
   (let [refs            (list-ref-records)
         live-sids       (set (lib/strip-nils (mapv live-snapshot-id live-rootfs-srcs)))
@@ -563,6 +589,18 @@
           (swap! removed-bytes + (or (file-size-bytes path) 0))
           (sys/rm path))))
 
+    {:bytes @removed-bytes}))
+
+(defn reconcile-store! []
+  (let [removed-bytes (atom 0)]
+    (doseq [path (list-blob-part-paths)]
+      (let [final (subs path 0 (- (count path) 5))]
+        (when (exists? final)
+          (swap! removed-bytes + (or (file-size-bytes path) 0))
+          (try (sys/rm path) (catch e nil)))))
+    (doseq [path (list-snapshot-temp-dirs)]
+      (swap! removed-bytes + (or (dir-size-bytes path) 0))
+      (try (sys/rm-rf path) (catch e nil)))
     {:bytes @removed-bytes}))
 
 (defn store-stats []
