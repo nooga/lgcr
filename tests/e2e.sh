@@ -793,6 +793,12 @@ expect_contains "$OUT" "cached image metadata or blobs are missing/corrupt" "run
 expect_contains "$OUT" "refreshing corrupt cached blob" "pull repairs the corrupt blob"
 expect_contains "$OUT" "Hello Podman World" "run succeeds after CAS repair"
 
+section "CAS resumes partial blob downloads"
+vm_sh "root=\"\${XDG_DATA_HOME:-\$HOME/.local/share}/lgcr/images/blobs/sha256\"; src=\"\$root/${HELLO_LAYER_DIGEST#sha256:}\"; part=\"\$src.part\"; rm -f \"\$part\"; head -c 65536 \"\$src\" > \"\$part\"; rm -f \"\$src\""
+OUT=$("$LGCR" pull "$HELLO_IMG" 2>&1)
+expect_contains "$OUT" "resuming cached partial blob" "pull resumes a staged partial layer blob"
+expect_contains "$OUT" "[pull] rootfs ready" "pull succeeds after resuming the blob"
+
 section "df reports exact CAS counts and byte totals"
 OUT=$("$LGCR" df 2>&1)
 expect_contains "$OUT" "TYPE" "df prints a header"
